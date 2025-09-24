@@ -27,12 +27,31 @@ import numpy as np
 _ENGINE = None
 _IS_PG = False
 
+from urllib.parse import quote_plus, urlparse, urlunparse, parse_qsl, urlencode
+
 def _normalize_pg_url(url: str) -> str:
-    # Chuẩn hoá driver để dùng psycopg2 trên Streamlit Cloud
+    # driver
     if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+psycopg2://", 1)
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
     elif url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+psycopg2://", 1)
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+    # đảm bảo password đã URL-encode & thêm sslmode=require
+    u = urlparse(url)
+    # encode password nếu chứa ký tự đặc biệt (#@$ …)
+    if u.password is not None:
+        pwd_enc = quote_plus(u.password)
+        netloc = f"{u.username}:{pwd_enc}@{u.hostname}"
+        if u.port:
+            netloc += f":{u.port}"
+        url = urlunparse((u.scheme, netloc, u.path, u.params, u.query, u.fragment))
+        u = urlparse(url)
+
+    # thêm sslmode=require nếu chưa có
+    q = dict(parse_qsl(u.query)) if u.query else {}
+    if "sslmode" not in q:
+        q["sslmode"] = "require"
+    url = urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
     return url
 
 def get_conn():
@@ -42,12 +61,14 @@ def get_conn():
         _IS_PG = True
         url = _normalize_pg_url(url)
         if _ENGINE is None:
+            # thêm pool_pre_ping để tránh connection chết
             _ENGINE = create_engine(url, pool_pre_ping=True, future=True)
         return _ENGINE.connect()
     else:
-        import sqlite3
+        import sqlite3, os
         os.makedirs("data", exist_ok=True)
-        return sqlite3.connect(os.path.join("data", "app.db"), check_same_thread=False)
+        return sqlite3.connect(os.path.join("data","app.db"), check_same_thread=False)
+
 
 def _qmark_to_named(sql: str, params):
     if not isinstance(params, (list, tuple)):
