@@ -30,15 +30,14 @@ _IS_PG = False
 from urllib.parse import quote_plus, urlparse, urlunparse, parse_qsl, urlencode
 
 def _normalize_pg_url(url: str) -> str:
-    # driver
+    # 1) chuẩn driver
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg2://", 1)
     elif url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
 
-    # đảm bảo password đã URL-encode & thêm sslmode=require
+    # 2) encode lại password nếu có ký tự đặc biệt
     u = urlparse(url)
-    # encode password nếu chứa ký tự đặc biệt (#@$ …)
     if u.password is not None:
         pwd_enc = quote_plus(u.password)
         netloc = f"{u.username}:{pwd_enc}@{u.hostname}"
@@ -47,7 +46,7 @@ def _normalize_pg_url(url: str) -> str:
         url = urlunparse((u.scheme, netloc, u.path, u.params, u.query, u.fragment))
         u = urlparse(url)
 
-    # thêm sslmode=require nếu chưa có
+    # 3) bắt buộc sslmode=require
     q = dict(parse_qsl(u.query)) if u.query else {}
     if "sslmode" not in q:
         q["sslmode"] = "require"
@@ -61,14 +60,12 @@ def get_conn():
         _IS_PG = True
         url = _normalize_pg_url(url)
         if _ENGINE is None:
-            # thêm pool_pre_ping để tránh connection chết
             _ENGINE = create_engine(url, pool_pre_ping=True, future=True)
         return _ENGINE.connect()
     else:
-        import sqlite3, os
+        import sqlite3
         os.makedirs("data", exist_ok=True)
         return sqlite3.connect(os.path.join("data","app.db"), check_same_thread=False)
-
 
 def _qmark_to_named(sql: str, params):
     if not isinstance(params, (list, tuple)):
@@ -81,7 +78,7 @@ def _qmark_to_named(sql: str, params):
     params2 = {f"p{i+1}": v for i, v in enumerate(params)}
     return sql2, params2
 
-# ---- Patch pandas.read_sql_query để dùng được cả Postgres & SQLite ----
+# Patch pandas.read_sql_query để chạy cả PG/SQLite
 _ORIG_PD_READ = pd.read_sql_query
 def _pd_read_sql_query_any(sql, conn, params=None, *args, **kwargs):
     if _IS_PG:
@@ -91,6 +88,15 @@ def _pd_read_sql_query_any(sql, conn, params=None, *args, **kwargs):
     else:
         return _ORIG_PD_READ(sql, conn, params=params, *args, **kwargs)
 pd.read_sql_query = _pd_read_sql_query_any
+
+#test loi
+import streamlit as st
+st.caption("DB: " + ("Postgres" if os.getenv("DATABASE_URL") else "SQLite"))
+try:
+    conn.execute(text("select 1"))
+    st.success("Kết nối DB OK")
+except Exception as e:
+    st.error(f"Lỗi kết nối DB: {e}")
 
 # ---- Patch SQLAlchemy Connection.execute để giả lập "INSERT OR REPLACE" ----
 _ORIG_SA_EXEC = _SAConnection.execute
