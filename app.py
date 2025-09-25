@@ -1,53 +1,57 @@
 # =========================
-# app.py — PART 1/5 (Core)
+# app.py — PART 1/5 (Core | PG only)
 # =========================
 import os, re, json, hashlib
 from datetime import datetime, date, timedelta
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection as _SAConnection
 
-# ---- UI base config (must be first Streamlit call)
-st.set_page_config(page_title="Fruit Tea ERP v5", page_icon="🧃", layout="wide")
+# ---- UI config (phải gọi đầu tiên)
+st.set_page_config(page_title="Fruit Tea ERP v5 (PG only)", page_icon="🧃", layout="wide")
 
 # ==========================================================
-# DB BRIDGE (SQLite local <-> Postgres online via Supabase)
+# KẾT NỐI POSTGRES (Supabase) — KHÔNG dùng SQLite
 # ==========================================================
 _ENGINE = None
-_IS_PG = False
 
 def _normalize_pg_url(url: str) -> str:
-    # Streamlit/HF secrets thường là "postgresql://", SQLAlchemy khuyên "postgresql+psycopg2://"
+    # Chuẩn hóa cho SQLAlchemy & ép SSL cho Supabase
     if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+psycopg2://", 1)
-    if url.startswith("postgresql://") and "+psycopg2" not in url:
-        return url.replace("postgresql://", "postgresql+psycopg2://", 1)
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif url.startswith("postgresql://") and "+psycopg2" not in url:
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    if "sslmode=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = url + f"{sep}sslmode=require"
     return url
 
-def get_conn():
-    """
-    Trả về kết nối SQLAlchemy Connection (Postgres) hoặc sqlite3.Connection (local).
-    """
-    global _ENGINE, _IS_PG
+def get_conn_pg():
+    global _ENGINE
     url = os.getenv("DATABASE_URL", "").strip()
-    if url:
-        _IS_PG = True
-        url = _normalize_pg_url(url)
-        if _ENGINE is None:
-            _ENGINE = create_engine(url, pool_pre_ping=True, future=True)
-        return _ENGINE.connect()
-    else:
-        # offline/local fallback
-        import sqlite3
-        os.makedirs("data", exist_ok=True)
-        return sqlite3.connect(os.path.join("data", "app.db"), check_same_thread=False)
+    if not url:
+        st.error("Thiếu biến môi trường DATABASE_URL (Postgres). Vào Settings/Secrets và đặt giá trị Session Pooler Supabase.")
+        st.stop()
+    url = _normalize_pg_url(url)
+    if _ENGINE is None:
+        _ENGINE = create_engine(url, pool_pre_ping=True, future=True)
+    try:
+        conn = _ENGINE.connect()
+        # test ping
+        conn.execute(text("select 1"))
+        return conn
+    except Exception as e:
+        st.error(f"Không kết nối được Postgres: {e}")
+        st.stop()
 
+# ==========================================================
+# TIỆN ÍCH SQL CHO POSTGRES
+# ==========================================================
 def _qmark_to_named(sql: str, params):
-    """Đổi ? -> :p1, :p2,... cho Postgres khi params là list/tuple."""
+    """Cho phép giữ style WHERE x=? ...; đổi ? -> :p1,:p2 khi dùng PG."""
     if not isinstance(params, (list, tuple)):
         return sql, (params or {})
     idx = 1
@@ -60,209 +64,201 @@ def _qmark_to_named(sql: str, params):
     params2 = {f"p{i+1}": v for i, v in enumerate(params)}
     return sql2, params2
 
-# ---- Patch pandas.read_sql_query để đọc cả sqlite & pg bằng cùng cú pháp
-_ORIG_PD_READ = pd.read_sql_query
-def _pd_read_sql_query_any(sql, conn, params=None, *args, **kwargs):
-    if _IS_PG:
-        if isinstance(params, (list, tuple)):
-            sql, params = _qmark_to_named(sql, params)
-        return _ORIG_PD_READ(text(sql), conn, params=params or {}, *args, **kwargs)
-    return _ORIG_PD_READ(sql, conn, params=params, *args, **kwargs)
-pd.read_sql_query = _pd_read_sql_query_any
-
-# ---- Patch Connection.execute để hỗ trợ "INSERT OR REPLACE" trên Postgres (thành UPSERT)
-_ORIG_SA_EXEC = _SAConnection.execute
-def _sa_exec_auto(self, statement, *multiparams, **kwargs):
-    if isinstance(statement, str):
-        stmt_upper = statement.upper()
-        # Chuyển "INSERT OR REPLACE INTO table(cols...)" -> INSERT ... ON CONFLICT (...) DO UPDATE ...
-        if _IS_PG and "INSERT OR REPLACE" in stmt_upper:
-            # Suy luận cột conflict phổ biến: code / email / batch_id, có thể chỉnh sau
-            m = re.search(r"INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\((.*?)\)", statement, re.I|re.S)
-            if m:
-                table = m.group(1).strip()
-                cols = [c.strip() for c in m.group(2).split(",")]
-                # Ưu tiên các khóa thường dùng
-                conflict = "code"
-                if "email" in cols: conflict = "email"
-                if "batch_id" in cols: conflict = "batch_id"
-                # build upsert
-                statement = re.sub(r"INSERT\s+OR\s+REPLACE", "INSERT", statement, flags=re.I)
-                update_sets = ", ".join([f"{c}=EXCLUDED.{c}" for c in cols if c != conflict])
-                statement += f" ON CONFLICT ({conflict}) DO UPDATE SET {update_sets}"
-        # Đổi multiparams dạng list -> named cho PG
-        if _IS_PG:
-            if multiparams and isinstance(multiparams[0], (list, tuple)):
-                sql2, params2 = _qmark_to_named(statement, multiparams[0])
-                return _ORIG_SA_EXEC(self, text(sql2), params2)
-            return _ORIG_SA_EXEC(self, text(statement), **kwargs)
-        # sqlite: thử exec driver trước để tận dụng ? param
-        try:
-            return self.exec_driver_sql(statement, *multiparams, **kwargs)
-        except Exception:
-            return _ORIG_SA_EXEC(self, text(statement), **kwargs)
-    return _ORIG_SA_EXEC(self, statement, *multiparams, **kwargs)
-_SAConnection.execute = _sa_exec_auto
-
-# === REPLACE: run_sql ===
-def run_sql(conn, sql, params=None):
-    """
-    Chạy SQL cho cả SQLite & Postgres.
-    - Với Postgres: nếu params là list/tuple (dùng ?), đổi sang dict tên :p1,:p2...
-    - Tuyệt đối KHÔNG dùng params or () với Postgres => phải là dict.
-    """
-    global _IS_PG
-    if _IS_PG and isinstance(params, (list, tuple)):
+def run_sql(conn, sql: str, params=None):
+    """Thực thi câu lệnh WRITE trên Postgres. Luôn truyền dict params."""
+    if isinstance(params, (list, tuple)):
         sql, params = _qmark_to_named(sql, params)
-    res = conn.execute(text(sql) if _IS_PG else sql, params or {})
+    res = conn.execute(text(sql), params or {})
     try:
         conn.commit()
     except Exception:
         pass
     return res
 
-
 def fetch_df(conn, sql: str, params=None) -> pd.DataFrame:
-    """Đọc DataFrame. Dùng chung cho PG & SQLite."""
-    return pd.read_sql_query(sql, conn, params=params)
+    """Đọc DataFrame từ Postgres (hỗ trợ ? bằng cách đổi sang :p1...)."""
+    if isinstance(params, (list, tuple)):
+        sql, params = _qmark_to_named(sql, params)
+    return pd.read_sql_query(text(sql), conn, params=params or {})
 
-# ==========================
-# SCHEMA (đảm bảo tối thiểu)
-# ==========================
-MIN_SCHEMA_SQL = """
--- cửa hàng
-CREATE TABLE IF NOT EXISTS stores(
-    code TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    address TEXT,
-    note TEXT
+# ==========================================================
+# SCHEMA (PG ONLY) — tạo nếu chưa có
+# ==========================================================
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS stores (
+  code        TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  address     TEXT DEFAULT '',
+  note        TEXT DEFAULT ''
 );
--- người dùng
-CREATE TABLE IF NOT EXISTS users(
-    email TEXT PRIMARY KEY,
-    display TEXT,
-    password TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'user',
-    store_code TEXT,
-    perms TEXT
+
+CREATE TABLE IF NOT EXISTS users (
+  email       TEXT PRIMARY KEY,
+  display     TEXT NOT NULL,
+  password    TEXT NOT NULL,
+  role        TEXT NOT NULL CHECK (role IN ('SuperAdmin','admin','user')),
+  store_code  TEXT NOT NULL REFERENCES stores(code) ON UPDATE CASCADE ON DELETE RESTRICT,
+  perms       TEXT NOT NULL DEFAULT ''
 );
--- danh mục sản phẩm
-CREATE TABLE IF NOT EXISTS products(
-    code TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    uom  TEXT NOT NULL DEFAULT 'kg',
-    cat_code TEXT NOT NULL
+
+CREATE TABLE IF NOT EXISTS products (
+  code        TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  uom         TEXT NOT NULL DEFAULT 'kg',
+  cat_code    TEXT NOT NULL CHECK (cat_code IN ('TRAI_CAY','PHU_GIA','COT','MUT','KHAC'))
 );
--- sổ kho (có cả số cốc)
-CREATE TABLE IF NOT EXISTS inventory_ledger(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    store TEXT NOT NULL,
-    pcode TEXT NOT NULL,
-    kind TEXT NOT NULL,                -- IN / OUT / ADJ
-    qty DOUBLE PRECISION NOT NULL,     -- kg (+/-)
-    price_in DOUBLE PRECISION,         -- giá nhập/kg khi IN
-    cups DOUBLE PRECISION DEFAULT 0.0, -- số cốc (+/-) cho CỐT & MỨT
-    ref TEXT                           -- tham chiếu giao dịch
+
+CREATE TABLE IF NOT EXISTS formulas (
+  code            TEXT PRIMARY KEY,
+  name            TEXT NOT NULL,
+  type            TEXT NOT NULL CHECK (type IN ('COT','MUT')),
+  output_pcode    TEXT NOT NULL REFERENCES products(code) ON UPDATE CASCADE ON DELETE RESTRICT,
+  output_uom      TEXT NOT NULL DEFAULT 'kg',
+  recovery        DOUBLE PRECISION NOT NULL DEFAULT 1.0,   -- chỉ CỐT
+  cups_per_kg     DOUBLE PRECISION NOT NULL DEFAULT 0.0,   -- số cốc / 1kg TP
+  fruits_csv      TEXT DEFAULT '',
+  additives_json  TEXT DEFAULT '{}',
+  note            TEXT DEFAULT ''                          -- ví dụ: SRC=TRAI_CAY | SRC=COT
 );
--- doanh thu đơn giản (CASH/BANK)
-CREATE TABLE IF NOT EXISTS revenue(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts DATE NOT NULL,
-    store TEXT NOT NULL,
-    amount DOUBLE PRECISION NOT NULL DEFAULT 0,
-    pay_method TEXT NOT NULL           -- CASH | BANK
+
+CREATE TABLE IF NOT EXISTS inventory_ledger (
+  id        BIGSERIAL PRIMARY KEY,
+  ts        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  store     TEXT NOT NULL REFERENCES stores(code) ON UPDATE CASCADE ON DELETE RESTRICT,
+  pcode     TEXT NOT NULL REFERENCES products(code) ON UPDATE CASCADE ON DELETE RESTRICT,
+  kind      TEXT NOT NULL CHECK (kind IN ('IN','OUT','ADJ')),
+  qty       DOUBLE PRECISION NOT NULL,                 -- kg (+/-)
+  price_in  DOUBLE PRECISION NOT NULL DEFAULT 0,       -- giá nhập/kg (đối với IN)
+  cups      DOUBLE PRECISION NOT NULL DEFAULT 0,       -- số cốc (+/-) cho CỐT/MỨT
+  ref       TEXT DEFAULT '',
+  note      TEXT DEFAULT ''
 );
--- công thức
-CREATE TABLE IF NOT EXISTS formulas(
-    code TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    type TEXT NOT NULL,                -- COT | MUT
-    output_pcode TEXT NOT NULL,
-    output_uom TEXT NOT NULL DEFAULT 'kg',
-    recovery DOUBLE PRECISION,         -- chỉ dùng cho CỐT
-    cups_per_kg DOUBLE PRECISION,      -- số cốc / 1 kg TP
-    fruits_csv TEXT,                   -- mã NL chính (trái cây hoặc cốt) dạng "A,B,C"
-    additives_json TEXT,               -- {ma_phu_gia: dinh_luong_kg_cho_1kg_sau_so}
-    note TEXT
+
+CREATE TABLE IF NOT EXISTS revenue (
+  id          BIGSERIAL PRIMARY KEY,
+  ts          DATE NOT NULL,
+  store       TEXT NOT NULL REFERENCES stores(code) ON UPDATE CASCADE ON DELETE RESTRICT,
+  amount      DOUBLE PRECISION NOT NULL DEFAULT 0,
+  pay_method  TEXT NOT NULL CHECK (pay_method IN ('CASH','BANK')),
+  pcode       TEXT,
+  qty         DOUBLE PRECISION,
+  unit_price  DOUBLE PRECISION,
+  note        TEXT DEFAULT ''
 );
--- WIP batch (mẻ đang làm)
-CREATE TABLE IF NOT EXISTS wip_batches(
-    batch_id TEXT PRIMARY KEY,
-    store TEXT NOT NULL,
-    ct_code TEXT NOT NULL,
-    type TEXT NOT NULL,                -- COT | MUT
-    src TEXT,                          -- TRAI_CAY | COT (cho MỨT)
-    kg_input DOUBLE PRECISION NOT NULL DEFAULT 0,
-    kg_after DOUBLE PRECISION NOT NULL DEFAULT 0,  -- kg sau sơ chế (cho MỨT)
-    ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+
+CREATE TABLE IF NOT EXISTS tscd (
+  id              BIGSERIAL PRIMARY KEY,
+  name            TEXT NOT NULL,
+  cost            DOUBLE PRECISION NOT NULL CHECK (cost >= 0),
+  dep_per_month   DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK (dep_per_month >= 0),
+  buy_date        DATE NOT NULL
 );
--- chi phí WIP (nếu cần)
-CREATE TABLE IF NOT EXISTS wip_cost(
-    batch_id TEXT PRIMARY KEY,
-    total_cost DOUBLE PRECISION NOT NULL DEFAULT 0
+
+CREATE TABLE IF NOT EXISTS syslog (
+  id          BIGSERIAL PRIMARY KEY,
+  ts          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  user_email  TEXT,
+  action      TEXT,
+  detail      TEXT
 );
--- nhật ký hệ thống
-CREATE TABLE IF NOT EXISTS syslog(
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    ts TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    actor TEXT,
-    action TEXT,
-    detail TEXT
+
+CREATE TABLE IF NOT EXISTS wip_batches (
+  batch_id    TEXT PRIMARY KEY,
+  store       TEXT NOT NULL REFERENCES stores(code) ON UPDATE CASCADE ON DELETE RESTRICT,
+  ct_code     TEXT NOT NULL REFERENCES formulas(code) ON UPDATE CASCADE ON DELETE RESTRICT,
+  type        TEXT NOT NULL CHECK (type IN ('COT','MUT')),
+  src         TEXT,
+  kg_input    DOUBLE PRECISION NOT NULL DEFAULT 0,
+  kg_after    DOUBLE PRECISION NOT NULL DEFAULT 0,
+  ts          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS wip_cost (
+  batch_id    TEXT PRIMARY KEY REFERENCES wip_batches(batch_id) ON UPDATE CASCADE ON DELETE CASCADE,
+  total_cost  DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_store           ON users(store_code);
+CREATE INDEX IF NOT EXISTS idx_products_cat          ON products(cat_code);
+CREATE INDEX IF NOT EXISTS idx_formulas_output       ON formulas(output_pcode);
+CREATE INDEX IF NOT EXISTS idx_ledger_store_p_ts     ON inventory_ledger(store, pcode, ts);
+CREATE INDEX IF NOT EXISTS idx_ledger_store_ts       ON inventory_ledger(store, ts);
+CREATE INDEX IF NOT EXISTS idx_revenue_store_ts      ON revenue(store, ts);
+CREATE INDEX IF NOT EXISTS idx_revenue_pcode_ts      ON revenue(pcode, ts);
 """
 
-def ensure_min_schema(conn):
-    if _IS_PG:
-        # ép kiểu auto increment
-        sql = MIN_SCHEMA_SQL.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY") \
-                            .replace("DOUBLE PRECISION", "DOUBLE PRECISION")
-        run_sql(conn, sql)
-    else:
-        run_sql(conn, MIN_SCHEMA_SQL)
+def ensure_schema_pg(conn):
+    run_sql(conn, SCHEMA_SQL)
 
-# ==========================
-# LOGGING & UTILS
-# ==========================
+# ==========================================================
+# SEED TỐI THIỂU (PG) — an toàn chạy nhiều lần
+# ==========================================================
+def seed_min_data(conn):
+    run_sql(conn, """
+        INSERT INTO stores(code,name) VALUES
+        ('HOSEN','Kho HOSEN')
+        ON CONFLICT (code) DO NOTHING;
+    """)
+    run_sql(conn, """
+        INSERT INTO users(email,display,password,role,store_code,perms) VALUES
+        ('admin@example.com','SuperAdmin','admin','SuperAdmin','HOSEN',
+         'KHO,SANXUAT,DANHMUC,DOANHTHU,BAOCAO,USERS,TSCD,TAICHINH,CT_EDIT')
+        ON CONFLICT (email) DO NOTHING;
+    """)
+    run_sql(conn, """
+        INSERT INTO products(code,name,uom,cat_code) VALUES
+        ('CAM_TUOI','Cam tươi','kg','TRAI_CAY'),
+        ('DUONG','Đường','kg','PHU_GIA'),
+        ('COT_CAM','Cốt cam','kg','COT'),
+        ('MUT_CAM','Mứt cam','kg','MUT')
+        ON CONFLICT (code) DO NOTHING;
+    """)
+    run_sql(conn, """
+        INSERT INTO formulas(code,name,type,output_pcode,output_uom,recovery,cups_per_kg,fruits_csv,additives_json,note)
+        VALUES
+        ('CT_COT_CAM','Cốt cam chuẩn','COT','COT_CAM','kg',1.10,10.0,'CAM_TUOI','{"DUONG":0.05}',''),
+        ('CT_MUT_CAM_TC','Mứt cam từ trái','MUT','MUT_CAM','kg',1.0,0.0,'CAM_TUOI','{"DUONG":0.10}','SRC=TRAI_CAY'),
+        ('CT_MUT_CAM_CT','Mứt cam từ cốt','MUT','MUT_CAM','kg',1.0,0.0,'COT_CAM','{"DUONG":0.08}','SRC=COT')
+        ON CONFLICT (code) DO NOTHING;
+    """)
+    run_sql(conn, "INSERT INTO syslog(action,detail) VALUES ('SEED','OK')")
+
+# ==========================================================
+# LOGGING, AUTH, QUYỀN
+# ==========================================================
 def log_action(conn, actor: str, action: str, detail: str = ""):
-    run_sql(conn, "INSERT INTO syslog(actor,action,detail) VALUES(?,?,?)",
-            (actor or "", action or "", detail or ""))
+    run_sql(conn, "INSERT INTO syslog(user_email,action,detail) VALUES(:u,:a,:d)",
+            {"u": actor or "", "a": action or "", "d": detail or ""})
 
 def sha256(txt: str) -> str:
     return hashlib.sha256((txt or "").encode("utf-8")).hexdigest()
 
-# Quyền đơn giản: chuỗi perms phẩy, hoặc role=SuperAdmin
 def has_perm(user: Dict[str, Any], perm: str) -> bool:
     if not user: return False
-    if (user.get("role") or "").lower() in ["superadmin", "admin", "super_admin"]:
+    role = (user.get("role") or "").lower()
+    if role in ("superadmin","admin"):
         return True
-    perms = (user.get("perms") or "").split(",")
-    return perm in [p.strip().upper() for p in perms if p.strip()]
+    perms = (user.get("perms") or "").upper().split(",")
+    return perm.upper() in [p.strip() for p in perms if p.strip()]
 
-# ==========================
-# AUTH (login/logout)
-# ==========================
 def login_form(conn) -> Optional[Dict[str, Any]]:
-    st.header("Đăng nhập hệ thống")
+    st.header("Đăng nhập")
     email = st.text_input("Email", value="admin@example.com")
-    pw = st.text_input("Mật khẩu", type="password")
-    btn = st.button("Đăng nhập")
-    if btn:
-        row = fetch_df(conn, "SELECT * FROM users WHERE email=?", (email,))
-        if row.empty:
-            st.error("Sai tài khoản / mật khẩu")
-            return None
-        r = row.iloc[0].to_dict()
-        if (r.get("password") in [pw, sha256(pw)]):  # chấp nhận plain hoặc sha256 (để chuyển dần)
-            st.success("Đăng nhập thành công")
-            return {
-                "email": r.get("email"),
-                "display": r.get("display") or r.get("email"),
-                "role": r.get("role") or "user",
-                "store": r.get("store_code") or "",
-                "perms": r.get("perms") or ""
-            }
-        st.error("Sai tài khoản / mật khẩu")
+    pw = st.text_input("Mật khẩu", type="password", value="admin")
+    if st.button("Đăng nhập"):
+        df = fetch_df(conn, "SELECT * FROM users WHERE email=:e", {"e": email})
+        if df.empty:
+            st.error("Sai tài khoản / mật khẩu"); return None
+        r = df.iloc[0].to_dict()
+        ok = (pw == r.get("password")) or (sha256(pw) == r.get("password"))
+        if not ok:
+            st.error("Sai tài khoản / mật khẩu"); return None
+        st.success("Đăng nhập thành công")
+        return {
+            "email": r["email"], "display": r.get("display") or r["email"],
+            "role": r.get("role") or "user", "store": r.get("store_code") or "HOSEN",
+            "perms": r.get("perms") or ""
+        }
     return None
 
 def require_login(conn) -> Dict[str, Any]:
@@ -271,356 +267,442 @@ def require_login(conn) -> Dict[str, Any]:
         if not u:
             st.stop()
         st.session_state["user"] = u
-        log_action(conn, u["email"], "LOGIN", "User logged in")
+        log_action(conn, u["email"], "LOGIN", "ok")
     return st.session_state["user"]
 
-# ==========================
-# COMMON DATA HELPERS
-# ==========================
-def prod_options(conn, cat_code: Optional[str] = None) -> pd.DataFrame:
-    if cat_code:
-        return fetch_df(conn, "SELECT code,name,uom,cat_code FROM products WHERE cat_code=? ORDER BY code", (cat_code,))
-    return fetch_df(conn, "SELECT code,name,uom,cat_code FROM products ORDER BY code")
-
+# ==========================================================
+# HELPERS DỮ LIỆU CHUNG (kho, DM)
+# ==========================================================
 def store_options(conn) -> pd.DataFrame:
     return fetch_df(conn, "SELECT code,name FROM stores ORDER BY code")
 
+def prod_options(conn, cat_code: Optional[str] = None) -> pd.DataFrame:
+    if cat_code:
+        return fetch_df(conn, "SELECT code,name,uom,cat_code FROM products WHERE cat_code=:c ORDER BY code", {"c": cat_code})
+    return fetch_df(conn, "SELECT code,name,uom,cat_code FROM products ORDER BY code")
+
 def inv_balance(conn, store: str, pcode: str) -> Tuple[float, float]:
-    """
-    Trả về (tồn kg, tồn cốc) hiện tại từ sổ kho.
-    """
+    """(tồn kg, tồn cốc)"""
     df = fetch_df(conn, """
-        SELECT COALESCE(SUM(qty),0) qty, COALESCE(SUM(cups),0) cups
-        FROM inventory_ledger WHERE store=? AND pcode=?
-    """, (store, pcode))
+        SELECT
+          COALESCE(SUM(CASE WHEN kind='IN'  THEN qty ELSE -qty END),0) AS ton_qty,
+          COALESCE(SUM(CASE WHEN kind='IN'  THEN cups ELSE -cups END),0) AS ton_cups
+        FROM inventory_ledger
+        WHERE store=:s AND pcode=:p
+    """, {"s": store, "p": pcode})
     if df.empty: return 0.0, 0.0
-    return float(df.iloc[0]["qty"] or 0.0), float(df.iloc[0]["cups"] or 0.0)
+    return float(df.iloc[0]["ton_qty"] or 0.0), float(df.iloc[0]["ton_cups"] or 0.0)
 
-def post_ledger(conn, store: str, pcode: str, kind: str, qty: float, price_in: Optional[float] = None,
-                cups: float = 0.0, ref: str = ""):
-    """
-    Ghi 1 dòng kho với cả số cốc (cups). kind: IN/OUT/ADJ
-    """
-    # kiểm tra SP có tồn tại
-    p = fetch_df(conn, "SELECT code FROM products WHERE code=?", (pcode,))
-    if p.empty:
-        raise ValueError("SP không tồn tại")
-    run_sql(conn, "INSERT INTO inventory_ledger(ts,store,pcode,kind,qty,price_in,cups,ref) VALUES(CURRENT_TIMESTAMP,?,?,?,?,?,?,?)",
-            (store, pcode, kind, float(qty or 0), price_in, float(cups or 0), ref))
-# =========================
-# app.py — PART 2/5 (Setup + Danh mục)
-# =========================
-
-# --- mở kết nối & đảm bảo schema
-conn = get_conn()
-ensure_min_schema(conn)
-
-# --- seed dữ liệu tối thiểu (an toàn, ON CONFLICT/REPLACE)
-# === REPLACE: seed_min_data ===
-def seed_min_data(conn):
-    """
-    Nạp dữ liệu mẫu tối thiểu: store, user admin, categories, products, sample formulas.
-    An toàn chạy lại nhiều lần.
-    """
-    # ----- Stores -----
+def post_ledger(conn, store: str, pcode: str, kind: str, qty: float,
+                price_in: float = 0.0, cups: float = 0.0, ref: str = "", note: str = ""):
+    """Ghi sổ kho với trường cups cho CỐT/MỨT."""
     run_sql(conn, """
-        INSERT INTO stores(code, name) VALUES
-        ('HOSEN','HOSEN')
-        ON CONFLICT (code) DO UPDATE SET name=EXCLUDED.name;
-    """)
+        INSERT INTO inventory_ledger(store,pcode,kind,qty,price_in,cups,ref,note)
+        VALUES (:s,:p,:k,:q,:pr,:c,:r,:n)
+    """, {"s": store, "p": pcode, "k": kind, "q": float(qty or 0.0),
+          "pr": float(price_in or 0.0), "c": float(cups or 0.0),
+          "r": ref or "", "n": note or ""})
 
-    # ----- Users (mặc định admin@example.com / admin) -----
-    # quyền đủ: KHO, SANXUAT, DANHMUC, DOANHTHU, BAOCAO, USERS, TSCD, TAICHINH, CT_EDIT
-    run_sql(conn, """
-        INSERT INTO users(email, display, password, role, store_code, perms)
-        VALUES ('admin@example.com','SuperAdmin','admin','SuperAdmin','HOSEN',
-                'KHO,SANXUAT,DANHMUC,DOANHTHU,BAOCAO,USERS,TSCD,TAICHINH,CT_EDIT')
-        ON CONFLICT (email) DO UPDATE SET
-            display=EXCLUDED.display,
-            password=EXCLUDED.password,
-            role=EXCLUDED.role,
-            store_code=EXCLUDED.store_code,
-            perms=EXCLUDED.perms;
-    """)
+def cups_per_kg_of(conn, pcode: str) -> float:
+    """Lấy cups/kg từ công thức gắn với output_pcode (nếu có)."""
+    df = fetch_df(conn, "SELECT cups_per_kg FROM formulas WHERE output_pcode=:p LIMIT 1", {"p": pcode})
+    if df.empty: return 0.0
+    try:
+        return float(df.iloc[0]["cups_per_kg"] or 0.0)
+    except Exception:
+        return 0.0
 
-    # ----- Categories -----
-    run_sql(conn, """
-        INSERT INTO categories(code, name) VALUES
-        ('TRAI_CAY','Trái cây'),
-        ('COT','Cốt'),
-        ('MUT','Mứt'),
-        ('PHU_GIA','Phụ gia')
-        ON CONFLICT (code) DO UPDATE SET name=EXCLUDED.name;
-    """)
-
-    # ----- Products mẫu -----
-    run_sql(conn, """
-        INSERT INTO products(code, name, uom, cat_code) VALUES
-        ('CAM_TUOI','Cam tươi','kg','TRAI_CAY'),
-        ('DUONG','Đường','kg','PHU_GIA'),
-        ('COT_CAM','Cốt cam','kg','COT'),
-        ('MUT_CAM','Mứt cam','kg','MUT')
-        ON CONFLICT (code) DO UPDATE SET
-            name=EXCLUDED.name, uom=EXCLUDED.uom, cat_code=EXCLUDED.cat_code;
-    """)
-
-    # ----- Formulas mẫu -----
-    # CỐT: có recovery & cups_per_kg; NVL chỉ từ TRÁI CÂY
-    run_sql(conn, """
-        INSERT INTO formulas(code, name, type, output_pcode, output_uom, recovery,
-                             cups_per_kg, fruits_csv, additives_json, note)
-        VALUES
-        ('CT_COT_CAM','Cốt cam chuẩn','COT','COT_CAM','kg',1.10, 10.0,
-         'CAM_TUOI', '{"DUONG":0.05}', ''),
-        ('CT_MUT_CAM_TUOI','Mứt cam từ trái','MUT','MUT_CAM','kg',1.0, 0.0,
-         'CAM_TUOI', '{"DUONG":0.10}', 'SRC=TRAI_CAY'),
-        ('CT_MUT_CAM_TU_COT','Mứt cam từ cốt','MUT','MUT_CAM','kg',1.0, 0.0,
-         'COT_CAM', '{"DUONG":0.08}', 'SRC=COT')
-        ON CONFLICT (code) DO UPDATE SET
-            name=EXCLUDED.name, type=EXCLUDED.type, output_pcode=EXCLUDED.output_pcode,
-            output_uom=EXCLUDED.output_uom, recovery=EXCLUDED.recovery,
-            cups_per_kg=EXCLUDED.cups_per_kg, fruits_csv=EXCLUDED.fruits_csv,
-            additives_json=EXCLUDED.additives_json, note=EXCLUDED.note;
-    """)
-
-    # ----- Nhật ký hệ thống -----
-    run_sql(conn, "INSERT INTO syslog(action, detail) VALUES ('SEED','Seed minimal data done');")
-
+# ==========================================================
+# KẾT NỐI & KHỞI TẠO
+# ==========================================================
+conn = get_conn_pg()
+ensure_schema_pg(conn)
 seed_min_data(conn)
 
-# --- trạng thái người dùng
-user = require_login(conn)
-st.caption("DB: " + ("Postgres" if os.getenv("DATABASE_URL") else "SQLite"))
+st.caption("DB: Postgres (Supabase) — OK")
+# =========================
+# app.py — PART 2/5 (Sidebar + Danh mục đầy đủ)
+# =========================
 
-# --- chọn cửa hàng ở sidebar
-with st.sidebar:
-    st.markdown("### 🏬 Cửa hàng")
-    stores_df = store_options(conn)
-    if stores_df.empty:
-        st.warning("Chưa có cửa hàng. Vào Danh mục → Cửa hàng để tạo mới.")
-        current_store = "HOSEN"
-    else:
-        store_list = stores_df["code"].tolist()
-        defidx = store_list.index(user.get("store") or "HOSEN") if (user.get("store") or "HOSEN") in store_list else 0
-        current_store = st.selectbox("Chọn kho/cửa hàng", store_list, index=defidx)
-    if "store" not in st.session_state or st.session_state["store"] != current_store:
-        st.session_state["store"] = current_store
-        # lưu store ưu tiên cho user (tùy chọn)
-        try:
-            run_sql(conn, "UPDATE users SET store_code=? WHERE email=?", (current_store, user["email"]))
-        except Exception:
-            pass
+# -------- Sidebar & Header --------
+def build_sidebar_and_get_menu(conn) -> str:
+    user = require_login(conn)
 
-# ==========================================================
-# DANH MỤC (Cửa hàng / Sản phẩm / Người dùng & Quyền)
-# ==========================================================
-def page_danhmuc(conn):
-    st.header("📚 Danh mục")
-    tabs = st.tabs(["Cửa hàng", "Sản phẩm", "Người dùng & Quyền"])
+    with st.sidebar:
+        st.markdown(f"### 👤 {user.get('display','')}")
+        st.caption(user.get("email",""))
+        st.divider()
 
-    # -------- CỬA HÀNG --------
-    with tabs[0]:
-        st.subheader("Cửa hàng")
-        df = store_options(conn)
-        st.dataframe(df, use_container_width=True)
-        st.markdown("**Thêm / Sửa**")
-        col1, col2 = st.columns(2)
-        with col1:
-            code = st.text_input("Mã cửa hàng", value=(df["code"].iloc[0] if not df.empty else "HOSEN"))
-            name = st.text_input("Tên cửa hàng")
-            addr = st.text_input("Địa chỉ")
-            note = st.text_input("Ghi chú")
-        with col2:
-            if st.button("💾 Lưu cửa hàng"):
-                if not code or not name:
-                    st.error("Mã và Tên là bắt buộc")
-                else:
-                    run_sql(conn, "INSERT OR REPLACE INTO stores(code,name,address,note) VALUES(?,?,?,?)",
-                            (code.strip(), name.strip(), addr.strip(), note.strip()))
-                    log_action(conn, user["email"], "DM_STORE_UPSERT", f"{code} - {name}")
-                    st.success("Đã lưu")
-                    st.experimental_rerun()
-            del_code = st.text_input("Xóa cửa hàng (nhập mã)")
-            if st.button("🗑️ Xóa cửa hàng"):
-                run_sql(conn, "DELETE FROM stores WHERE code=?", (del_code.strip(),))
-                log_action(conn, user["email"], "DM_STORE_DELETE", del_code.strip())
-                st.success("Đã xóa")
-                st.experimental_rerun()
-
-    # -------- SẢN PHẨM --------
-    with tabs[1]:
-        st.subheader("Sản phẩm")
-        dfp = fetch_df(conn, "SELECT code,name,uom,cat_code FROM products ORDER BY code")
-        st.dataframe(dfp, use_container_width=True)
-        st.markdown("**Thêm / Sửa**")
-        col1, col2 = st.columns(2)
-        with col1:
-            pcode = st.text_input("Mã SP")
-            pname = st.text_input("Tên SP")
-            uom = st.text_input("ĐVT", value="kg")
-            cat = st.selectbox("Nhóm SP", ["TRAI_CAY","PHU_GIA","COT","MUT"], index=0)
-        with col2:
-            if st.button("💾 Lưu SP"):
-                if not pcode or not pname:
-                    st.error("Mã và Tên là bắt buộc")
-                else:
-                    run_sql(conn, "INSERT OR REPLACE INTO products(code,name,uom,cat_code) VALUES(?,?,?,?)",
-                            (pcode.strip(), pname.strip(), uom.strip(), cat.strip()))
-                    log_action(conn, user["email"], "DM_PRODUCT_UPSERT", pcode.strip())
-                    st.success("Đã lưu")
-                    st.experimental_rerun()
-            del_p = st.text_input("Xóa SP (nhập mã)")
-            if st.button("🗑️ Xóa SP"):
-                run_sql(conn, "DELETE FROM products WHERE code=?", (del_p.strip(),))
-                log_action(conn, user["email"], "DM_PRODUCT_DELETE", del_p.strip())
-                st.success("Đã xóa")
-                st.experimental_rerun()
-
-    # -------- NGƯỜI DÙNG & QUYỀN --------
-    with tabs[2]:
-        if not has_perm(user, "USERS"):
-            st.warning("Bạn không có quyền truy cập mục Người dùng.")
+        # Chọn cửa hàng
+        stores_df = store_options(conn)
+        if stores_df.empty:
+            st.warning("⚠️ Chưa có cửa hàng. Tạo ở Danh mục → Cửa hàng.")
+            current_store = "HOSEN"
         else:
-            st.subheader("Người dùng & Quyền")
-            dfu = fetch_df(conn, "SELECT email,display,role,store_code,perms FROM users ORDER BY email")
-            st.dataframe(dfu, use_container_width=True)
-            st.markdown("**Thêm / Sửa**")
-            col1, col2 = st.columns(2)
+            store_list = stores_df["code"].tolist()
+            default_code = user.get("store") or "HOSEN"
+            idx = store_list.index(default_code) if default_code in store_list else 0
+            current_store = st.selectbox("🏬 Cửa hàng", store_list, index=idx, help="Áp dụng cho toàn bộ nghiệp vụ")
+
+        # Đồng bộ store vào session + user
+        if st.session_state.get("store") != current_store:
+            st.session_state["store"] = current_store
+            try:
+                run_sql(conn, "UPDATE users SET store_code=:s WHERE email=:e", {"s": current_store, "e": user["email"]})
+            except Exception:
+                pass
+
+        st.divider()
+        menu = st.radio(
+            "📚 Menu",
+            ["Dashboard", "Danh mục", "Kho", "Sản xuất", "Doanh thu", "Báo cáo", "TSCD", "Nhật ký", "Đăng xuất"],
+            index=1,  # mặc định mở Danh mục lần đầu
+            label_visibility="visible",
+            horizontal=False
+        )
+        st.divider()
+        st.caption("DB: Postgres (Supabase)")
+    return menu
+
+# --------- Tiện ích UI nhỏ ---------
+def _pill(label, color="#eef", text_color="#333"):
+    st.markdown(
+        f"""<span style="padding:4px 10px;border-radius:10px;background:{color};color:{text_color};
+        font-size:12px;border:1px solid rgba(0,0,0,0.06);">{label}</span>""",
+        unsafe_allow_html=True
+    )
+
+# ========================= DANH MỤC =========================
+def page_danhmuc(conn):
+    st.header("📚 Danh mục (Master Data)")
+
+    tabs = st.tabs(["🏬 Cửa hàng", "📦 Sản phẩm", "👥 Người dùng & Quyền"])
+
+    # ========== TAB 1: CỬA HÀNG ==========
+    with tabs[0]:
+        st.subheader("🏬 Cửa hàng")
+        # Lọc/tìm
+        k = st.text_input("Tìm theo mã/tên", placeholder="Nhập mã hoặc tên cửa hàng...")
+        df = fetch_df(conn, "SELECT code,name,address,note FROM stores ORDER BY code")
+        if k:
+            df = df[df["code"].str.contains(k, case=False) | df["name"].str.contains(k, case=False)]
+        st.dataframe(df, use_container_width=True, height=300)
+
+        st.markdown("#### Thêm / Sửa")
+        with st.form("store_form", clear_on_submit=False):
+            col1, col2 = st.columns([1,2])
             with col1:
-                u_email = st.text_input("Email", value="")
-                u_display = st.text_input("Tên hiển thị", value="")
-                u_role = st.selectbox("Vai trò", ["SuperAdmin","admin","user"], index=2)
-                u_store = st.text_input("Store mặc định", value=st.session_state.get("store","HOSEN"))
+                code = st.text_input("Mã cửa hàng*", value=(df["code"].iloc[0] if not df.empty else "HOSEN"))
             with col2:
-                u_perms = st.text_area("Quyền riêng (phẩy):\nVD: KHO,BAOCAO,SANXUAT,DM,USERS,CT_EDIT", height=80)
-                u_pw = st.text_input("Mật khẩu (đặt/xóa trắng = giữ nguyên)", type="password", value="")
-                if st.button("💾 Lưu người dùng"):
-                    if not u_email:
-                        st.error("Cần nhập email")
-                    else:
-                        # nếu không nhập PW => giữ nguyên; nếu có => lưu plain và hash tùy bạn chuyển đổi sau
-                        existed = fetch_df(conn, "SELECT email,password FROM users WHERE email=?", (u_email,))
-                        pw_save = (existed.iloc[0]["password"] if (not existed.empty and not u_pw) else (u_pw or "123456"))
-                        run_sql(conn, """
-                            INSERT OR REPLACE INTO users(email,display,password,role,store_code,perms)
-                            VALUES(?,?,?,?,?,?)
-                        """, (u_email.strip(), u_display.strip() or u_email.strip(), pw_save,
-                              u_role, u_store.strip(), u_perms.strip()))
-                        log_action(conn, user["email"], "DM_USER_UPSERT", u_email.strip())
-                        st.success("Đã lưu")
-                        st.experimental_rerun()
-                del_u = st.text_input("Xóa user (email)")
-                if st.button("🗑️ Xóa user"):
-                    run_sql(conn, "DELETE FROM users WHERE email=?", (del_u.strip(),))
-                    log_action(conn, user["email"], "DM_USER_DELETE", del_u.strip())
-                    st.success("Đã xóa")
+                name = st.text_input("Tên cửa hàng*")
+            address = st.text_input("Địa chỉ")
+            note = st.text_input("Ghi chú")
+            submitted = st.form_submit_button("💾 Lưu", use_container_width=False)
+        if submitted:
+            if not code or not name:
+                st.error("⚠️ Mã và Tên bắt buộc.")
+            else:
+                run_sql(conn,
+                    """INSERT INTO stores(code,name,address,note)
+                       VALUES(:c,:n,:a,:no)
+                       ON CONFLICT (code) DO UPDATE SET
+                           name=EXCLUDED.name, address=EXCLUDED.address, note=EXCLUDED.note""",
+                    {"c": code.strip(), "n": name.strip(), "a": address.strip(), "no": note.strip()})
+                log_action(conn, st.session_state["user"]["email"], "DM_STORE_UPSERT", code.strip())
+                st.success("✅ Đã lưu cửa hàng.")
+                st.experimental_rerun()
+
+        with st.expander("🗑️ Xoá cửa hàng", expanded=False):
+            del_code = st.text_input("Nhập mã cửa hàng cần xoá")
+            if st.button("Xác nhận xoá"):
+                if not del_code:
+                    st.warning("Nhập mã trước khi xoá.")
+                else:
+                    run_sql(conn, "DELETE FROM stores WHERE code=:c", {"c": del_code.strip()})
+                    log_action(conn, st.session_state["user"]["email"], "DM_STORE_DELETE", del_code.strip())
+                    st.success("Đã xoá.")
                     st.experimental_rerun()
+
+    # ========== TAB 2: SẢN PHẨM ==========
+    with tabs[1]:
+        st.subheader("📦 Sản phẩm")
+        colf1, colf2, colf3 = st.columns([1,1,2])
+        with colf1:
+            cat_filter = st.selectbox("Nhóm", ["TẤT CẢ","TRAI_CAY","PHU_GIA","COT","MUT","KHAC"], index=0)
+        with colf2:
+            kw = st.text_input("Tìm mã/tên", placeholder="VD: CAM, DUONG ...")
+        with colf3:
+            _pill("Lưu ý: COT/MUT sẽ có 'số cốc' trong kho", "#e6fffb", "#096")
+
+        dfp = fetch_df(conn, "SELECT code,name,uom,cat_code FROM products ORDER BY code")
+        if cat_filter != "TẤT CẢ":
+            dfp = dfp[dfp["cat_code"] == cat_filter]
+        if kw:
+            dfp = dfp[dfp["code"].str.contains(kw, case=False) | dfp["name"].str.contains(kw, case=False)]
+        st.dataframe(dfp, use_container_width=True, height=320)
+
+        st.markdown("#### Thêm / Sửa sản phẩm")
+        with st.form("product_form", clear_on_submit=False):
+            col1, col2, col3, col4 = st.columns([1,2,1,1])
+            with col1:
+                pcode = st.text_input("Mã SP*")
+            with col2:
+                pname = st.text_input("Tên SP*")
+            with col3:
+                uom = st.text_input("ĐVT*", value="kg")
+            with col4:
+                cat = st.selectbox("Nhóm*", ["TRAI_CAY","PHU_GIA","COT","MUT","KHAC"])
+            okp = st.form_submit_button("💾 Lưu SP")
+        if okp:
+            if not pcode or not pname or not uom:
+                st.error("⚠️ Mã/Tên/ĐVT bắt buộc.")
+            else:
+                run_sql(conn,
+                    """INSERT INTO products(code,name,uom,cat_code)
+                       VALUES(:c,:n,:u,:cat)
+                       ON CONFLICT (code) DO UPDATE SET
+                           name=EXCLUDED.name, uom=EXCLUDED.uom, cat_code=EXCLUDED.cat_code""",
+                    {"c": pcode.strip(), "n": pname.strip(), "u": uom.strip(), "cat": cat})
+                log_action(conn, st.session_state["user"]["email"], "DM_PRODUCT_UPSERT", pcode.strip())
+                st.success("✅ Đã lưu sản phẩm.")
+                st.experimental_rerun()
+
+        with st.expander("🗑️ Xoá sản phẩm", expanded=False):
+            del_p = st.text_input("Nhập mã SP cần xoá")
+            if st.button("Xác nhận xoá SP"):
+                if not del_p:
+                    st.warning("Nhập mã trước khi xoá.")
+                else:
+                    run_sql(conn, "DELETE FROM products WHERE code=:c", {"c": del_p.strip()})
+                    log_action(conn, st.session_state["user"]["email"], "DM_PRODUCT_DELETE", del_p.strip())
+                    st.success("Đã xoá.")
+                    st.experimental_rerun()
+
+    # ========== TAB 3: NGƯỜI DÙNG & QUYỀN ==========
+    with tabs[2]:
+        if not has_perm(st.session_state.get("user"), "USERS"):
+            st.warning("⛔ Bạn không có quyền truy cập mục Người dùng.")
+        else:
+            st.subheader("👥 Người dùng & Quyền")
+            kwu = st.text_input("Tìm email/tên", placeholder="Nhập email hoặc tên hiển thị...")
+            dfu = fetch_df(conn, "SELECT email,display,role,store_code,perms FROM users ORDER BY email")
+            if kwu:
+                dfu = dfu[dfu["email"].str.contains(kwu, case=False) | dfu["display"].str.contains(kwu, case=False)]
+            st.dataframe(dfu, use_container_width=True, height=320)
+
+            st.markdown("#### Thêm / Sửa người dùng")
+            with st.form("user_form", clear_on_submit=False):
+                c1, c2 = st.columns([2,1])
+                with c1:
+                    u_email = st.text_input("Email*", value="")
+                    u_display = st.text_input("Tên hiển thị", value="")
+                    u_store = st.text_input("Store mặc định", value=st.session_state.get("store","HOSEN"))
+                with c2:
+                    u_role = st.selectbox("Vai trò", ["SuperAdmin","admin","user"], index=2)
+                    u_pw = st.text_input("Mật khẩu (để trống = giữ nguyên)", type="password")
+                    perms_hint = "VD: KHO,SANXUAT,DANHMUC,DOANHTHU,BAOCAO,USERS,TSCD,TAICHINH,CT_EDIT"
+                    u_perms = st.text_area("Quyền riêng (CSV)", value="", height=70, help=perms_hint)
+
+                ok_u = st.form_submit_button("💾 Lưu người dùng")
+            if ok_u:
+                if not u_email:
+                    st.error("⚠️ Email bắt buộc.")
+                else:
+                    existed = fetch_df(conn, "SELECT email,password FROM users WHERE email=:e", {"e": u_email.strip()})
+                    pw_save = (existed.iloc[0]["password"] if (not existed.empty and not u_pw)
+                               else (u_pw or "123456"))
+                    run_sql(conn, """
+                        INSERT INTO users(email,display,password,role,store_code,perms)
+                        VALUES(:e,:d,:p,:r,:s,:m)
+                        ON CONFLICT (email) DO UPDATE SET
+                            display=EXCLUDED.display,
+                            password=EXCLUDED.password,
+                            role=EXCLUDED.role,
+                            store_code=EXCLUDED.store_code,
+                            perms=EXCLUDED.perms
+                    """, {"e": u_email.strip(), "d": (u_display or u_email).strip(),
+                          "p": pw_save, "r": u_role, "s": u_store.strip(), "m": (u_perms or "").strip()})
+                    log_action(conn, st.session_state["user"]["email"], "DM_USER_UPSERT", u_email.strip())
+                    st.success("✅ Đã lưu người dùng.")
+                    st.experimental_rerun()
+
+            with st.expander("🔑 Đổi mật khẩu nhanh", expanded=False):
+                me = st.session_state["user"]["email"]
+                old = st.text_input("Mật khẩu cũ", type="password")
+                new1 = st.text_input("Mật khẩu mới", type="password")
+                new2 = st.text_input("Nhập lại mật khẩu mới", type="password")
+                if st.button("Cập nhật mật khẩu"):
+                    if not new1 or new1 != new2:
+                        st.error("Mật khẩu mới không trùng khớp.")
+                    else:
+                        # bỏ check old nếu bạn đang lưu plain; có thể thêm kiểm tra nếu dùng hash
+                        run_sql(conn, "UPDATE users SET password=:p WHERE email=:e", {"p": new1, "e": me})
+                        log_action(conn, me, "USER_CHANGE_PASSWORD", "")
+                        st.success("Đã đổi mật khẩu.")
+
+            with st.expander("🗑️ Xoá người dùng", expanded=False):
+                del_u = st.text_input("Email cần xoá")
+                if st.button("Xác nhận xoá user"):
+                    if not del_u:
+                        st.warning("Nhập email trước khi xoá.")
+                    else:
+                        run_sql(conn, "DELETE FROM users WHERE email=:e", {"e": del_u.strip()})
+                        log_action(conn, st.session_state["user"]["email"], "DM_USER_DELETE", del_u.strip())
+                        st.success("Đã xoá.")
+                        st.experimental_rerun()
+
+
+# =============== Router cho phần 2 (tạm thời) ===============
+# Phần 3/4/5 sẽ định nghĩa các page khác; tạm router tối thiểu để bạn xem UI Danh mục ngay.
+if "menu_inited" not in st.session_state:
+    st.session_state["menu_inited"] = True
+
+_menu = build_sidebar_and_get_menu(conn)
+if _menu == "Danh mục":
+    page_danhmuc(conn)
+elif _menu == "Đăng xuất":
+    log_action(conn, st.session_state["user"]["email"], "LOGOUT", "")
+    st.session_state.clear()
+    st.experimental_rerun()
+else:
+    st.info("Tiếp tục dán Phần 3/5, 4/5, 5/5 để hoàn thiện các mục còn lại (Kho, Sản xuất, Doanh thu, Báo cáo, TSCD, Nhật ký).")
 # =========================
-# app.py — PART 3/5 (Kho + Báo cáo nâng cao)
+# app.py — PART 3/5 (Kho + Báo cáo nâng cao | PG only)
 # =========================
 
-# ---------- TIỆN ÍCH DỮ LIỆU KHO ----------
-def product_list(conn, cat=None, keyword=""):
+# ---------- TIỆN ÍCH DỮ LIỆU ----------
+def product_list(conn, cat: str | None = None, keyword: str = "") -> pd.DataFrame:
     sql = "SELECT code,name,uom,cat_code FROM products"
-    cond, params = [], []
+    where, params = [], {}
     if cat:
-        cond.append("cat_code=?"); params.append(cat)
+        where.append("cat_code = :cat"); params["cat"] = cat
     if keyword:
-        cond.append("(code LIKE ? OR name LIKE ?)"); params += [f"%{keyword}%", f"%{keyword}%"]
-    if cond:
-        sql += " WHERE " + " AND ".join(cond)
+        where.append("(code ILIKE :kw OR name ILIKE :kw)"); params["kw"] = f"%{keyword}%"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY code"
-    return fetch_df(conn, sql, tuple(params) if params else None)
+    return fetch_df(conn, sql, params)
 
-def write_ledger(conn, ts, store, pcode, kind, qty, price_in=0.0, note="", cups=0.0):
-    run_sql(conn, """
-        INSERT INTO inventory_ledger(ts,store,pcode,kind,qty,price_in,note,cups)
-        VALUES(?,?,?,?,?,?,?,?)
-    """, (ts, store, pcode, kind, qty, price_in, note, cups))
-    log_action(conn, st.session_state["user"]["email"], f"KHO_{kind}", f"{store}-{pcode}-{qty}")
-
-def cups_per_kg_of(conn, pcode):
-    # lấy số cốc/kg từ CT (ưu tiên CT loại COT/MUT có output_pcode = pcode)
-    df = fetch_df(conn, "SELECT cups_per_kg FROM formulas WHERE output_pcode=? ORDER BY code LIMIT 1", (pcode,))
-    if not df.empty and pd.notna(df.iloc[0]["cups_per_kg"]):
-        return float(df.iloc[0]["cups_per_kg"] or 0.0)
-    return 0.0
-
-def stock_snapshot(conn, store, to_date=None):
-    """Tồn kho đến ngày to_date (<=). Tính cả 'số cốc' cho nhóm COT/MUT."""
-    params = [store]
-    sql = """
-        SELECT pcode,
-               SUM(CASE WHEN kind='IN'  THEN qty ELSE -qty END) AS ton_qty,
-               SUM(CASE WHEN kind='IN'  THEN cups ELSE -cups END) AS ton_cups
-        FROM inventory_ledger
-        WHERE store=? {date_filter}
-        GROUP BY pcode
+def avg_cost(conn, store: str, pcode: str) -> float:
     """
+    Giá bình quân di động theo thứ tự thời gian sổ kho.
+    """
+    df = fetch_df(conn, """
+        SELECT kind, qty, price_in
+        FROM inventory_ledger
+        WHERE store=:s AND pcode=:p
+        ORDER BY ts, id
+    """, {"s": store, "p": pcode})
+    stock = 0.0
+    cost  = 0.0
+    for _, r in df.iterrows():
+        k = r["kind"]; q = float(r["qty"] or 0); p = float(r["price_in"] or 0)
+        if k == "IN":
+            if q > 0:
+                total = cost * stock + p * q
+                stock += q
+                cost = (total / stock) if stock > 0 else 0.0
+        else:  # OUT / ADJ giảm
+            stock -= q
+            if stock < 0: stock = 0.0
+    return float(cost)
+
+def stock_snapshot(conn, store: str, to_date: date | None = None) -> pd.DataFrame:
+    """
+    Ảnh chốt tồn (<= to_date). Trả về: pcode, name, uom, cat_code, ton_qty, ton_cups, avg_cost, value.
+    - ton_cups tự suy từ cups_per_kg nếu chưa ghi cups trong ledger.
+    """
+    params = {"s": store}
     date_filter = ""
     if to_date:
-        date_filter = "AND date(ts)<=?"
-        params.append(to_date.strftime("%Y-%m-%d"))
-    df = fetch_df(conn, sql.format(date_filter=date_filter), tuple(params))
+        date_filter = "AND ts::date <= :d"
+        params["d"] = to_date.strftime("%Y-%m-%d")
+    df = fetch_df(conn, f"""
+        SELECT pcode,
+               SUM(CASE WHEN kind='IN' THEN qty ELSE -qty END)  AS ton_qty,
+               SUM(CASE WHEN kind='IN' THEN cups ELSE -cups END) AS ton_cups
+        FROM inventory_ledger
+        WHERE store=:s {date_filter}
+        GROUP BY pcode
+        HAVING ABS(SUM(CASE WHEN kind='IN' THEN qty ELSE -qty END)) > 0
+            OR ABS(SUM(CASE WHEN kind='IN' THEN cups ELSE -cups END)) > 0
+        ORDER BY pcode
+    """, params)
     if df.empty:
         return pd.DataFrame(columns=["pcode","name","uom","cat_code","ton_qty","avg_cost","value","ton_cups"])
 
-    # gắn thông tin sản phẩm
     prods = fetch_df(conn, "SELECT code,name,uom,cat_code FROM products")
     df = df.merge(prods, left_on="pcode", right_on="code", how="left").drop(columns=["code"])
-    # avg cost & giá trị
+
+    # avg cost & trị giá
     df["avg_cost"] = df["pcode"].apply(lambda c: avg_cost(conn, store, c))
-    df["value"] = df["avg_cost"] * df["ton_qty"]
-    # nếu một số bản ghi cups thiếu (0) thì suy từ ton_qty * cups/kg
+    df["value"]    = df["avg_cost"] * df["ton_qty"]
+
+    # bảo đảm cups cho COT/MUT
     def ensure_cups(row):
         cups = float(row.get("ton_cups") or 0.0)
         if cups == 0.0 and row["cat_code"] in ("COT","MUT"):
             cups = float(row["ton_qty"] or 0.0) * cups_per_kg_of(conn, row["pcode"])
         return cups
     df["ton_cups"] = df.apply(ensure_cups, axis=1)
-    return df[["pcode","name","uom","cat_code","ton_qty","avg_cost","value","ton_cups"]].sort_values("pcode")
+
+    return df[["pcode","name","uom","cat_code","ton_qty","avg_cost","value","ton_cups"]]
+
+# ---------- GHI SỔ TIỆN LỢI ----------
+def write_ledger(conn, ts: date, store: str, pcode: str, kind: str,
+                 qty: float, unit_cost: float = 0.0, note: str = "", cups: float = 0.0, ref: str = ""):
+    post_ledger(conn, store=store, pcode=pcode, kind=kind,
+                qty=qty, price_in=unit_cost, cups=cups, ref=ref, note=note)
+    log_action(conn, st.session_state["user"]["email"], f"KHO_{kind}",
+               f"{store}-{pcode}-{qty} ({'cups=' + str(cups) if cups else ''})")
 
 # ---------- TRANG KHO ----------
 def page_kho(conn):
     st.header(f"📦 Quản lý kho – {st.session_state.get('store','')}")
-    tab_in, tab_out, tab_ton = st.tabs(["Phiếu nhập", "Phiếu xuất", "Tồn kho"])
+    tab_in, tab_out, tab_ton = st.tabs(["Phiếu nhập", "Phiếu xuất", "Tồn kho (nâng cao)"])
 
     # ====== PHIẾU NHẬP ======
     with tab_in:
         st.subheader("Phiếu nhập")
         c1, c2, c3 = st.columns([1,2,1])
         with c1:
-            ngay = st.date_input("Ngày", datetime.today().date())
+            ngay = st.date_input("Ngày nhập", datetime.today().date())
         with c2:
-            kw = st.text_input("Tìm SP (mã/tên) để nhập")
+            kw = st.text_input("Tìm SP (mã/tên) để nhập", placeholder="Gõ vài ký tự…")
             df_opts = product_list(conn, keyword=kw)
-            sp = st.selectbox("Chọn sản phẩm", df_opts["code"].tolist() if not df_opts.empty else [], format_func=lambda m: f"{m} - {df_opts.set_index('code').loc[m,'name']}" if not df_opts.empty and m in df_opts["code"].values else m)
+            def fmt_in(m):
+                if df_opts.empty or m not in df_opts["code"].values: return m
+                return f"{m} — {df_opts.set_index('code').loc[m,'name']}"
+            sp = st.selectbox("Chọn sản phẩm", df_opts["code"].tolist() if not df_opts.empty else [], format_func=fmt_in)
         with c3:
-            qty = st.number_input("Số lượng nhập", 0.0, step=0.1)
-            price = st.number_input("Đơn giá nhập (VND/ĐVT)", 0.0, step=100.0)
+            qty = st.number_input("Số lượng nhập", 0.0, step=0.1, min_value=0.0)
+            price = st.number_input("Đơn giá nhập (VND/ĐVT)", 0.0, step=100.0, min_value=0.0)
 
-        # 'số cốc' ghi thẳng vào ledger (nếu là COT/MUT) = qty * cups/kg
-        cups_calc = 0.0
+        # cups tự tính cho COT/MUT
+        cups_in = 0.0
         if sp:
-            pd_info = fetch_df(conn, "SELECT cat_code FROM products WHERE code=?", (sp,))
+            pd_info = fetch_df(conn, "SELECT cat_code FROM products WHERE code=:c", {"c": sp})
             if not pd_info.empty and pd_info.iloc[0]["cat_code"] in ("COT","MUT"):
-                cups_calc = qty * cups_per_kg_of(conn, sp)
-        st.caption(f"👉 Số cốc ghi nhận: {cups_calc:.0f}")
+                cups_in = qty * cups_per_kg_of(conn, sp)
+        st.caption(f"👉 Số cốc ghi nhận: **{cups_in:.0f}**")
 
-        note = st.text_input("Ghi chú")
+        note = st.text_input("Ghi chú (tuỳ chọn)")
         if st.button("💾 Lưu phiếu nhập"):
             if not sp or qty <= 0:
-                st.error("Chọn SP và số lượng > 0")
+                st.error("Chọn sản phẩm và nhập số lượng > 0.")
             else:
-                write_ledger(conn, ngay, st.session_state["store"], sp, "IN", qty, price_in=price, note=note, cups=cups_calc)
-                st.success("Đã lưu phiếu nhập")
+                write_ledger(conn, ngay, st.session_state["store"], sp, "IN", qty, unit_cost=price, note=note, cups=cups_in, ref="PURCHASE")
+                st.success("✅ Đã lưu phiếu nhập.")
                 st.experimental_rerun()
 
         st.markdown("**Lịch sử nhập gần đây**")
         df_in = fetch_df(conn, """
-            SELECT ts,pcode,qty,price_in,note,cups FROM inventory_ledger
-            WHERE store=? AND kind='IN' ORDER BY ts DESC LIMIT 200
-        """, (st.session_state["store"],))
+            SELECT ts::timestamp(0) AS ts, pcode, qty, price_in, cups, note
+            FROM inventory_ledger
+            WHERE store=:s AND kind='IN'
+            ORDER BY ts DESC
+            LIMIT 200
+        """, {"s": st.session_state["store"]})
         st.dataframe(df_in, use_container_width=True)
 
     # ====== PHIẾU XUẤT ======
@@ -630,66 +712,74 @@ def page_kho(conn):
         with c1:
             ngay2 = st.date_input("Ngày xuất", datetime.today().date(), key="ngayx")
         with c2:
-            kw2 = st.text_input("Tìm SP (mã/tên) để xuất")
+            kw2 = st.text_input("Tìm SP (mã/tên) để xuất", key="kwx")
             df_opts2 = product_list(conn, keyword=kw2)
-            sp2 = st.selectbox("Chọn sản phẩm xuất", df_opts2["code"].tolist() if not df_opts2.empty else [], key="spx",
-                               format_func=lambda m: f"{m} - {df_opts2.set_index('code').loc[m,'name']}" if not df_opts2.empty and m in df_opts2["code"].values else m)
+            def fmt_out(m):
+                if df_opts2.empty or m not in df_opts2["code"].values: return m
+                return f"{m} — {df_opts2.set_index('code').loc[m,'name']}"
+            sp2 = st.selectbox("Chọn sản phẩm xuất", df_opts2["code"].tolist() if not df_opts2.empty else [], key="spx", format_func=fmt_out)
         with c3:
-            qty2 = st.number_input("Số lượng xuất", 0.0, step=0.1, key="qtyx")
+            qty2 = st.number_input("Số lượng xuất", 0.0, step=0.1, min_value=0.0, key="qtyx")
 
+        # cups trừ kho cho COT/MUT
         cups_out = 0.0
         if sp2:
-            pd_info2 = fetch_df(conn, "SELECT cat_code FROM products WHERE code=?", (sp2,))
+            pd_info2 = fetch_df(conn, "SELECT cat_code FROM products WHERE code=:c", {"c": sp2})
             if not pd_info2.empty and pd_info2.iloc[0]["cat_code"] in ("COT","MUT"):
                 cups_out = qty2 * cups_per_kg_of(conn, sp2)
-        st.caption(f"👉 Số cốc trừ kho: {cups_out:.0f}")
+        st.caption(f"👉 Số cốc trừ kho: **{cups_out:.0f}**")
 
-        note2 = st.text_input("Ghi chú xuất")
+        note2 = st.text_input("Ghi chú xuất", key="note_x")
         if st.button("📤 Lưu phiếu xuất"):
             if not sp2 or qty2 <= 0:
-                st.error("Chọn SP và số lượng > 0")
+                st.error("Chọn sản phẩm và nhập số lượng > 0.")
             else:
-                write_ledger(conn, ngay2, st.session_state["store"], sp2, "OUT", qty2, price_in=0.0, note=note2, cups=cups_out)
-                st.success("Đã lưu phiếu xuất")
+                write_ledger(conn, ngay2, st.session_state["store"], sp2, "OUT", qty2, unit_cost=0.0, note=note2, cups=cups_out, ref="ISSUE")
+                st.success("✅ Đã lưu phiếu xuất.")
                 st.experimental_rerun()
 
         st.markdown("**Lịch sử xuất gần đây**")
         df_out = fetch_df(conn, """
-            SELECT ts,pcode,qty,note,cups FROM inventory_ledger
-            WHERE store=? AND kind='OUT' ORDER BY ts DESC LIMIT 200
-        """, (st.session_state["store"],))
+            SELECT ts::timestamp(0) AS ts, pcode, qty, cups, note
+            FROM inventory_ledger
+            WHERE store=:s AND kind='OUT'
+            ORDER BY ts DESC
+            LIMIT 200
+        """, {"s": st.session_state["store"]})
         st.dataframe(df_out, use_container_width=True)
 
     # ====== TỒN KHO ======
     with tab_ton:
-        st.subheader("Tồn kho (có số cốc)")
+        st.subheader("Tồn kho (nâng cao)")
         c1, c2, c3, c4 = st.columns([1,1,1,2])
         with c1:
-            fr = st.date_input("Từ ngày", datetime.today().date().replace(day=1))
+            to = st.date_input("Chốt đến ngày", datetime.today().date(), key="ton_to")
         with c2:
-            to = st.date_input("Đến ngày", datetime.today().date())
+            catf = st.selectbox("Nhóm SP", ["TẤT CẢ","TRAI_CAY","PHU_GIA","COT","MUT","KHAC"])
         with c3:
-            catf = st.selectbox("Nhóm SP", ["TẤT CẢ","TRAI_CAY","PHU_GIA","COT","MUT"])
+            name_like = st.text_input("Mã/Tên chứa ...", key="ton_kw")
         with c4:
-            name_like = st.text_input("Mã/Tên chứa ...")
+            st.caption("Lưu ý: COT/MUT hiển thị thêm **số cốc**. Giá trị tồn dùng **bình quân di động**.")
 
         df_ton = stock_snapshot(conn, st.session_state["store"], to)
-        # lọc nâng cao
         if catf != "TẤT CẢ":
             df_ton = df_ton[df_ton["cat_code"] == catf]
         if name_like:
             df_ton = df_ton[df_ton["pcode"].str.contains(name_like, case=False) | df_ton["name"].str.contains(name_like, case=False)]
 
         st.dataframe(df_ton, use_container_width=True)
-        colx, coly = st.columns(2)
+
+        colx, coly, colz = st.columns(3)
         with colx:
             total_val = float(df_ton["value"].sum()) if not df_ton.empty else 0.0
-            total_cups = float(df_ton["ton_cups"].sum()) if not df_ton.empty else 0.0
             st.metric("Tổng giá trị tồn (VND)", f"{total_val:,.0f}")
         with coly:
-            st.metric("Tổng số cốc quy đổi", f"{total_cups:,.0f}")
+            total_qty = float(df_ton["ton_qty"].sum()) if not df_ton.empty else 0.0
+            st.metric("Tổng số lượng (kg)", f"{total_qty:,.2f}")
+        with colz:
+            total_cups = float(df_ton["ton_cups"].sum()) if not df_ton.empty else 0.0
+            st.metric("Tổng số cốc (COT/MUT)", f"{total_cups:,.0f}")
 
-        # Xuất CSV
         if not df_ton.empty:
             st.download_button(
                 "⬇️ Xuất tồn kho (CSV)",
@@ -701,206 +791,226 @@ def page_kho(conn):
 # ---------- BÁO CÁO NÂNG CAO ----------
 def page_baocao(conn):
     st.header("📈 Báo cáo nâng cao")
-    tab_tonkho, tab_taichinh = st.tabs(["Tồn kho & Trị giá", "Tài chính (doanh thu – COGS – lãi gộp)"])
+    tab_tonkho, tab_taichinh = st.tabs(["Tồn kho & Trị giá", "Tài chính (Doanh thu – COGS – Lãi gộp)"])
 
-    # ---- TỒN & TRỊ GIÁ ----
+    # ---- TỒN KHO & TRỊ GIÁ ----
     with tab_tonkho:
-        to = st.date_input("Chốt đến ngày", datetime.today().date(), key="ton_to")
+        to = st.date_input("Chốt đến ngày", datetime.today().date(), key="rpt_ton_to")
         df_ton = stock_snapshot(conn, st.session_state["store"], to)
-        st.dataframe(df_ton, use_container_width=True)
+        st.dataframe(df_ton, use_container_width=True, height=380)
         st.metric("Tổng trị giá", f"{df_ton['value'].sum():,.0f} VND")
         st.metric("Tổng số cốc", f"{df_ton['ton_cups'].sum():,.0f}")
         if not df_ton.empty:
             st.download_button("⬇️ CSV", df_ton.to_csv(index=False).encode("utf-8"),
                                file_name=f"bao_cao_ton_{to}.csv", mime="text/csv")
 
-    # ---- TÀI CHÍNH NÂNG CAO ----
+    # ---- TÀI CHÍNH: Doanh thu, COGS, Lãi gộp ----
     with tab_taichinh:
-        colF = st.columns(3)
-        fr = st.date_input("Từ ngày", datetime.today().date().replace(day=1), key="tc_fr")
-        to = st.date_input("Đến ngày", datetime.today().date(), key="tc_to")
-        pay = st.multiselect("Kênh thanh toán", ["CASH","BANK"], default=["CASH","BANK"])
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            fr = st.date_input("Từ ngày", datetime.today().date().replace(day=1), key="tc_fr")
+        with c2:
+            to = st.date_input("Đến ngày", datetime.today().date(), key="tc_to")
+        with c3:
+            pay = st.multiselect("Kênh thanh toán", ["CASH","BANK"], default=["CASH","BANK"], key="tc_pay")
 
-        # Doanh thu ghi ở bảng revenue(ts,store,pcode,qty,unit_price,pay_method)
-        # Nếu bạn chỉ cần tổng tiền theo kênh thanh toán: không cần pcode
-        rev = fetch_df(conn, f"""
-            SELECT date(ts) d, pay_method, SUM(qty*unit_price) amount, SUM(qty) total_qty
-            FROM revenue
-            WHERE store=? AND date(ts) BETWEEN ? AND ?
-                  AND pay_method IN ({",".join(["?"]*len(pay))})
-            GROUP BY date(ts), pay_method
-            ORDER BY d
-        """, (st.session_state["store"], fr.strftime("%Y-%m-%d"), to.strftime("%Y-%m-%d"), *pay)) if len(pay)>0 else pd.DataFrame(columns=["d","pay_method","amount","total_qty"])
+        # Doanh thu theo ngày & kênh
+        if pay:
+            rev = fetch_df(conn, f"""
+                SELECT ts::date AS d, pay_method, SUM(COALESCE(amount,0)) AS amount
+                FROM revenue
+                WHERE store=:s AND ts BETWEEN :fr AND :to AND pay_method = ANY(:pay)
+                GROUP BY d, pay_method
+                ORDER BY d
+            """, {"s": st.session_state["store"], "fr": fr.strftime("%Y-%m-%d"),
+                  "to": to.strftime("%Y-%m-%d"), "pay": pay})
+        else:
+            rev = pd.DataFrame(columns=["d","pay_method","amount"])
         st.subheader("Doanh thu theo ngày & phương thức")
         st.dataframe(rev, use_container_width=True)
-        st.metric("Tổng doanh thu", f"{(rev['amount'].sum() if not rev.empty else 0):,.0f} VND")
+        doanh_thu = float(rev["amount"].sum() if not rev.empty else 0.0)
 
-        # COGS (giá vốn) ~ tổng xuất kho loại 'OUT_SALE' (nếu bạn dùng kind riêng) hoặc từ revenue.qty * avg_cost(pcode)
-        # Ở đây: nếu có cột pcode/qty trong revenue => ước tính giá vốn theo avg_cost tại thời điểm báo cáo
+        # COGS ~ từ revenue chi tiết pcode/qty (nếu có), nhân với avg_cost tại thời điểm báo cáo
         rev_detail = fetch_df(conn, """
-            SELECT pcode, SUM(qty) qty FROM revenue
-            WHERE store=? AND date(ts) BETWEEN ? AND ?
+            SELECT pcode, SUM(COALESCE(qty,0)) AS qty
+            FROM revenue
+            WHERE store=:s AND ts BETWEEN :fr AND :to AND pcode IS NOT NULL
             GROUP BY pcode
-        """, (st.session_state["store"], fr.strftime("%Y-%m-%d"), to.strftime("%Y-%m-%d")))
+        """, {"s": st.session_state["store"], "fr": fr.strftime("%Y-%m-%d"), "to": to.strftime("%Y-%m-%d")})
         if not rev_detail.empty:
             rev_detail["avg_cost"] = rev_detail["pcode"].apply(lambda c: avg_cost(conn, st.session_state["store"], c))
             rev_detail["cogs"] = rev_detail["qty"] * rev_detail["avg_cost"]
-            cogs_total = rev_detail["cogs"].sum()
+            cogs_total = float(rev_detail["cogs"].sum())
         else:
             cogs_total = 0.0
 
-        doanh_thu = float(rev["amount"].sum() if not rev.empty else 0.0)
         lai_gop = doanh_thu - cogs_total
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Doanh thu", f"{doanh_thu:,.0f} VND")
-        col2.metric("Giá vốn (ước tính)", f"{cogs_total:,.0f} VND")
-        col3.metric("Lãi gộp", f"{lai_gop:,.0f} VND")
 
-        # Xuất CSV các bảng
-        if not rev.empty:
-            st.download_button("⬇️ Doanh thu CSV", rev.to_csv(index=False).encode("utf-8"),
-                               file_name=f"doanh_thu_{fr}_{to}.csv", mime="text/csv")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Doanh thu", f"{doanh_thu:,.0f} VND")
+        m2.metric("Giá vốn (ước tính)", f"{cogs_total:,.0f} VND")
+        m3.metric("Lãi gộp", f"{lai_gop:,.0f} VND")
+
+        st.markdown("**Chi tiết COGS (nếu có bán theo SP)**")
         if not rev_detail.empty:
+            st.dataframe(rev_detail, use_container_width=True)
             st.download_button("⬇️ COGS chi tiết CSV", rev_detail.to_csv(index=False).encode("utf-8"),
-                               file_name=f"cogs_chi_tiet_{fr}_{to}.csv", mime="text/csv")
+                               file_name=f"cogs_detail_{fr}_{to}.csv", mime="text/csv")
+        else:
+            st.info("Chưa có doanh thu chi tiết theo sản phẩm. Bạn có thể ghi ở mục **Doanh thu → Ghi chi tiết theo SP** (Phần 5).")
+
+# =============== Router cập nhật (gọi được Kho/Báo cáo) ===============
+if _menu == "Kho":
+    page_kho(conn)
+elif _menu == "Báo cáo":
+    page_baocao(conn)
 # =========================
-# app.py — PART 4/5 (Công thức + Sản xuất 3 loại)
+# app.py — PART 4/5 (Công thức + Sản xuất | PG only)
 # =========================
 
-# ---- avg_cost: bình quân di động cho 1 mã hàng ----
-def avg_cost(conn, store: str, pcode: str) -> float:
-    dfc = fetch_df(conn, """
-        SELECT kind, qty, price_in
-        FROM inventory_ledger
-        WHERE store = ? AND pcode = ?
-        ORDER BY ts
-    """, (store, pcode))
-    stock = 0.0
-    cost  = 0.0
-    for _, r in dfc.iterrows():
-        k = r["kind"]; q = float(r["qty"] or 0); p = float(r["price_in"] or 0)
-        if k == "IN":
-            if q > 0:
-                total = cost * stock + p * q
-                stock += q
-                cost = (total / stock) if stock > 0 else 0.0
-        else:  # OUT / ADJ-
-            stock -= q
-            if stock < 0: stock = 0.0
-    return float(cost)
-
-# ---- tiện ích lấy list sản phẩm theo cat (để làm selectbox đẹp) ----
-def _prod_select(conn, cats):
+# ---------- Helper chọn sản phẩm ----------
+def _prod_select(conn, cats: list[str]):
     df = fetch_df(conn,
-        "SELECT code, name FROM products WHERE cat_code IN (" +
-        ",".join(["?"]*len(cats)) + ") ORDER BY code", tuple(cats))
+        "SELECT code,name FROM products WHERE cat_code = ANY(:cats) ORDER BY code",
+        {"cats": cats})
     opts = df["code"].tolist() if not df.empty else []
-    def fmt(x): 
+    def fmt(x):
         if df.empty or x not in df["code"].values: return x
         return f"{x} — {df.set_index('code').loc[x,'name']}"
     return opts, fmt
 
+# ---------- Ước tính đơn giá TP từ NVL chính ----------
+def _avg_cost_from_raws(conn, store: str, raws: list[str]) -> float:
+    if not raws: return 0.0
+    vals = []
+    for r in raws:
+        c = avg_cost(conn, store, r)
+        if c > 0:
+            vals.append(c)
+        else:
+            last = fetch_df(conn, """
+                SELECT price_in FROM inventory_ledger
+                WHERE store=:s AND pcode=:p AND kind='IN'
+                ORDER BY ts DESC LIMIT 1
+            """, {"s": store, "p": r})
+            if not last.empty:
+                vals.append(float(last.iloc[0]["price_in"] or 0.0))
+    return float(sum(vals)/len(vals)) if vals else 0.0
+
+# ---------- Xuất NVL & Nhập TP ----------
+def _consume_materials(conn, store: str, ts: date, items: dict[str, float], ref: str):
+    for p, q in items.items():
+        if q > 0:
+            write_ledger(conn, ts, store, p, "OUT", q, unit_cost=0.0, note="", cups=0.0, ref=ref)
+
+def _receive_finish(conn, store: str, ts: date, pcode: str, kg_out: float, unit_cost: float, cups_per_kg: float, ref: str):
+    cups_in = max(0.0, float(kg_out or 0.0)) * max(0.0, float(cups_per_kg or 0.0))
+    write_ledger(conn, ts, store, pcode, "IN", kg_out, unit_cost=unit_cost, note="", cups=cups_in, ref=ref)
+
 # ==========================================
-# CÔNG THỨC (CRUD) — chuẩn hóa theo yêu cầu
+# CÔNG THỨC (CRUD) — chỉ người có quyền CT_EDIT
 # ==========================================
 def page_congthuc(conn):
-    st.header("🧪 Công thức (COT / MUT)")
+    st.subheader("🧪 Công thức (COT / MUT)")
     if not has_perm(st.session_state.get("user"), "CT_EDIT"):
-        st.warning("Bạn không có quyền truy cập Công thức.")
+        st.info("Bạn không có quyền sửa Công thức.")
         return
 
     df_ct = fetch_df(conn, """
         SELECT code,name,type,output_pcode,output_uom,recovery,cups_per_kg,fruits_csv,additives_json,note
         FROM formulas ORDER BY code
     """)
-    st.dataframe(df_ct, use_container_width=True)
+    st.dataframe(df_ct, use_container_width=True, height=260)
 
     mode = st.radio("Chế độ", ["Tạo mới", "Sửa/Xóa"], horizontal=True)
 
-    # ----- chọn SP đầu ra theo loại -----
-    def out_opts_by_type(t):
-        cats = ["COT"] if t == "COT" else ["MUT"]
-        return _prod_select(conn, cats)
+    def out_opts_by_type(t: str):
+        return _prod_select(conn, ["COT"] if t == "COT" else ["MUT"])
 
+    # ----- TẠO MỚI -----
     if mode == "Tạo mới":
-        colL, colR = st.columns([1,1])
-        with colL:
-            code = st.text_input("Mã CT")
-            name = st.text_input("Tên CT")
-            typ  = st.selectbox("Loại CT", ["COT","MUT"])
+        c1, c2 = st.columns(2)
+        with c1:
+            code = st.text_input("Mã CT*")
+            name = st.text_input("Tên CT*")
+            typ  = st.selectbox("Loại CT*", ["COT","MUT"])
             out_list, out_fmt = out_opts_by_type(typ)
-            outp = st.selectbox("SP đầu ra (mã)", out_list, format_func=out_fmt)
-            uom  = st.text_input("ĐVT TP", "kg")
-        with colR:
+            outp = st.selectbox("SP đầu ra (mã)*", out_list, format_func=out_fmt)
+            uom  = st.text_input("ĐVT TP*", "kg")
+        with c2:
             rec  = st.number_input("Hệ số thu hồi (chỉ CỐT)", 1.0, step=0.1, disabled=(typ!="COT"))
             cups = st.number_input("Số cốc / 1kg TP", 0.0, step=0.1)
-            mut_src = st.radio("Nguồn NVL (chỉ MỨT)", ["TRAI_CAY","COT"], index=0, horizontal=True)
+            mut_src = st.radio("Nguồn NVL (chỉ cho MỨT)", ["TRÁI_CÂY","CỐT"], index=0, horizontal=True)
 
-        # ----- NVL theo loại & nguồn -----
-        if typ == "COT" or mut_src == "TRAI_CAY":
-            raw_opts, raw_fmt = _prod_select(conn, ["TRAI_CAY"])
+        # NVL theo loại/nguồn
+        if typ == "COT" or mut_src == "TRÁI_CÂY":
+            raw_opts, raw_fmt = _prod_select(conn, ["TRAI_CÂY"])
         else:
             raw_opts, raw_fmt = _prod_select(conn, ["COT"])
-        raw_sel = st.multiselect("Nguyên liệu chính", raw_opts, format_func=raw_fmt)
+        raw_sel = st.multiselect("Nguyên liệu chính*", raw_opts, format_func=raw_fmt)
 
-        # ----- phụ gia (tùy chọn) -----
+        # Phụ gia (kg / 1kg sau sơ)
         add_opts, add_fmt = _prod_select(conn, ["PHU_GIA"])
-        add_sel = st.multiselect("Phụ gia", add_opts, format_func=add_fmt)
+        add_pick = st.multiselect("Phụ gia (tùy chọn)", add_opts, format_func=add_fmt)
         add_q = {}
-        if add_sel:
-            st.caption("Định lượng phụ gia (kg / 1kg sau sơ chế)")
-            for c in add_sel:
+        if add_pick:
+            st.caption("Định lượng phụ gia (kg / 1kg sau sơ)")
+            for c in add_pick:
                 add_q[c] = st.number_input(f"{add_fmt(c)}", 0.0, step=0.01, key=f"add_{c}")
 
         if st.button("💾 Lưu công thức"):
-            if not code or not name or not outp:
-                st.error("Thiếu mã, tên hoặc SP đầu ra.")
+            if not code or not name or not outp or not raw_sel:
+                st.error("Thiếu dữ liệu bắt buộc (Mã/Tên/SP đầu ra/NVL).")
             else:
-                note = f"SRC={mut_src}" if typ=="MUT" else ""
+                note = f"SRC={'TRAI_CÂY' if typ=='MUT' and mut_src=='TRÁI_CÂY' else ('COT' if typ=='MUT' else '')}"
                 run_sql(conn, """
-                    INSERT OR REPLACE INTO formulas
+                    INSERT INTO formulas
                         (code,name,type,output_pcode,output_uom,recovery,cups_per_kg,fruits_csv,additives_json,note)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
-                """, (code.strip(), name.strip(), typ, outp, uom,
-                      (rec if typ=="COT" else 1.0), cups,
-                      ",".join(raw_sel), json.dumps(add_q), note))
-                log_action(conn, st.session_state["user"]["email"], "CT_SAVE", code)
-                st.success("Đã lưu công thức")
+                    VALUES (:c,:n,:t,:o,:u,:r,:cpk,:fr,:aj,:no)
+                    ON CONFLICT (code) DO UPDATE SET
+                        name=EXCLUDED.name, type=EXCLUDED.type, output_pcode=EXCLUDED.output_pcode,
+                        output_uom=EXCLUDED.output_uom, recovery=EXCLUDED.recovery, cups_per_kg=EXCLUDED.cups_per_kg,
+                        fruits_csv=EXCLUDED.fruits_csv, additives_json=EXCLUDED.additives_json, note=EXCLUDED.note
+                """, {"c": code.strip(), "n": name.strip(), "t": typ, "o": outp, "u": uom,
+                      "r": (rec if typ=="COT" else 1.0), "cpk": cups,
+                      "fr": ",".join(raw_sel), "aj": json.dumps(add_q), "no": note})
+                log_action(conn, st.session_state["user"]["email"], "CT_SAVE", code.strip())
+                st.success("✅ Đã lưu công thức.")
                 st.experimental_rerun()
 
-    else:  # Sửa/Xóa
+    # ----- SỬA / XÓA -----
+    else:
         if df_ct.empty:
             st.info("Chưa có công thức."); return
-        pick = st.selectbox("Chọn CT", df_ct["code"])
-        row  = df_ct[df_ct["code"]==pick].iloc[0]
+        ct_pick = st.selectbox("Chọn CT", df_ct["code"].tolist())
+        row = df_ct[df_ct["code"]==ct_pick].iloc[0].to_dict()
+
         typ  = st.selectbox("Loại CT", ["COT","MUT"], index=(0 if row["type"]=="COT" else 1))
-
         out_list, out_fmt = out_opts_by_type(typ)
-        try:
-            def_idx = out_list.index(row["output_pcode"]) if row["output_pcode"] in out_list else 0
-        except Exception:
-            def_idx = 0
+        def_idx = out_list.index(row["output_pcode"]) if row["output_pcode"] in out_list else 0
 
-        colL, colR = st.columns([1,1])
-        with colL:
+        c1, c2 = st.columns(2)
+        with c1:
             name = st.text_input("Tên CT", row["name"])
             outp = st.selectbox("SP đầu ra (mã)", out_list, index=def_idx, format_func=out_fmt)
-            uom  = st.text_input("ĐVT TP", row["output_uom"])
-        with colR:
-            rec  = st.number_input("Hệ số thu hồi (CỐT)", float(row["recovery"] or 1.0), step=0.1, disabled=(typ!="COT"), key="rec_edit")
+            uom  = st.text_input("ĐVT TP", row["output_uom"] or "kg")
+        with c2:
+            rec  = st.number_input("Hệ số thu hồi (CỐT)", float(row["recovery"] or 1.0),
+                                   step=0.1, disabled=(typ!="COT"), key="rec_edit")
             cups = st.number_input("Số cốc / 1kg TP", float(row["cups_per_kg"] or 0.0), step=0.1)
-            src0 = "TRAI_CAY"
+            src0 = "TRÁI_CÂY"
             if typ=="MUT" and (row["note"] or "").startswith("SRC="):
                 src0 = (row["note"] or "").split("=",1)[1]
-            mut_src = st.radio("Nguồn NVL (MỨT)", ["TRAI_CAY","COT"], index=(0 if src0=="TRAI_CAY" else 1), horizontal=True)
+            mut_src = st.radio("Nguồn NVL (MỨT)", ["TRÁI_CÂY","CỐT"], index=(0 if src0=="TRÁI_CÂY" else 1), horizontal=True)
 
-        # NVL khởi tạo
-        if typ == "COT" or mut_src == "TRAI_CAY":
-            raw_opts, raw_fmt = _prod_select(conn, ["TRAI_CAY"])
+        # NVL theo nguồn
+        if typ == "COT" or mut_src == "TRÁI_CÂY":
+            raw_opts, raw_fmt = _prod_select(conn, ["TRAI_CÂY"])
         else:
             raw_opts, raw_fmt = _prod_select(conn, ["COT"])
         current_raws = [x for x in (row["fruits_csv"] or "").split(",") if x]
-        raw_sel = st.multiselect("Nguyên liệu chính", raw_opts, default=[r for r in current_raws if r in raw_opts], format_func=raw_fmt)
+        raw_sel = st.multiselect("Nguyên liệu chính", raw_opts,
+                                 default=[r for r in current_raws if r in raw_opts], format_func=raw_fmt)
 
         # Phụ gia
         try:
@@ -911,74 +1021,63 @@ def page_congthuc(conn):
         add_pick = st.multiselect("Phụ gia", add_opts, default=list(adds0.keys()), format_func=add_fmt)
         add_q = {}
         if add_pick:
-            st.caption("Định lượng phụ gia (kg / 1kg sau sơ chế)")
+            st.caption("Định lượng phụ gia (kg / 1kg sau sơ)")
             for c in add_pick:
                 add_q[c] = st.number_input(f"{add_fmt(c)}", float(adds0.get(c,0.0)), step=0.01, key=f"add_edit_{c}")
 
-        c1, c2 = st.columns(2)
-        with c1:
+        colA, colB = st.columns(2)
+        with colA:
             if st.button("💾 Cập nhật"):
-                note = f"SRC={mut_src}" if typ=="MUT" else ""
+                note = f"SRC={'TRÁI_CÂY' if typ=='MUT' and mut_src=='TRÁI_CÂY' else ('CỐT' if typ=='MUT' else '')}"
                 run_sql(conn, """
-                    INSERT OR REPLACE INTO formulas
-                        (code,name,type,output_pcode,output_uom,recovery,cups_per_kg,fruits_csv,additives_json,note)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
-                """, (pick, name.strip(), typ, outp, uom,
-                      (rec if typ=="COT" else 1.0), cups,
-                      ",".join(raw_sel), json.dumps(add_q), note))
-                log_action(conn, st.session_state["user"]["email"], "CT_UPDATE", pick)
-                st.success("Đã cập nhật")
+                    UPDATE formulas
+                    SET name=:n, type=:t, output_pcode=:o, output_uom=:u,
+                        recovery=:r, cups_per_kg=:cpk, fruits_csv=:fr, additives_json=:aj, note=:no
+                    WHERE code=:c
+                """, {"n": name.strip(), "t": typ, "o": outp, "u": uom,
+                      "r": (rec if typ=="COT" else 1.0), "cpk": cups,
+                      "fr": ",".join(raw_sel), "aj": json.dumps(add_q), "no": note, "c": row["code"]})
+                log_action(conn, st.session_state["user"]["email"], "CT_UPDATE", row["code"])
+                st.success("✅ Đã cập nhật.")
                 st.experimental_rerun()
-        with c2:
-            if st.button("🗑️ Xóa công thức"):
-                run_sql(conn, "DELETE FROM formulas WHERE code=?", (pick,))
-                log_action(conn, st.session_state["user"]["email"], "CT_DELETE", pick)
-                st.success("Đã xóa")
+        with colB:
+            if st.button("🗑️ Xoá công thức"):
+                run_sql(conn, "DELETE FROM formulas WHERE code=:c", {"c": row["code"]})
+                log_action(conn, st.session_state["user"]["email"], "CT_DELETE", row["code"])
+                st.success("Đã xoá.")
                 st.experimental_rerun()
 
 # ==========================================
-# SẢN XUẤT — 3 luồng: CỐT / MỨT từ TRÁI CÂY / MỨT từ CỐT
+# SẢN XUẤT — CỐT / MỨT (TRÁI CÂY) / MỨT (CỐT)
 # ==========================================
-def _consume_materials(conn, store, items: Dict[str, float], ref: str):
-    """Xuất NVL theo dict {pcode: qty}, cups=0 (NVL & phụ gia không tính cốc)."""
-    for p, q in items.items():
-        if q > 0:
-            post_ledger(conn, store, p, "OUT", q, price_in=0.0, cups=0.0, ref=ref)
-
-def _receive_finish(conn, store, pcode, kg_out, unit_cost, cups_per_kg, ref):
-    """Nhập TP, cups = kg_out * cups_per_kg."""
-    cups_in = max(0.0, float(kg_out or 0.0)) * max(0.0, float(cups_per_kg or 0.0))
-    post_ledger(conn, store, pcode, "IN", kg_out, price_in=float(unit_cost or 0.0), cups=cups_in, ref=ref)
-
-def _avg_cost_from_raws(conn, store, raws: list) -> float:
-    """Lấy bình quân đơn giá các NVL chính (ước tính giá TP)."""
-    if not raws: return 0.0
-    vals = []
-    for r in raws:
-        c = avg_cost(conn, store, r)
-        if c > 0: vals.append(c)
-        else:
-            # fallback: đơn giá nhập gần nhất
-            last = fetch_df(conn, """
-                SELECT price_in FROM inventory_ledger
-                WHERE store=? AND pcode=? AND kind='IN'
-                ORDER BY ts DESC LIMIT 1
-            """, (store, r))
-            if not last.empty:
-                vals.append(float(last.iloc[0]["price_in"] or 0))
-    return float(sum(vals)/len(vals)) if vals else 0.0
-
 def page_sanxuat(conn):
     st.header("🏭 Sản xuất")
-    store = st.session_state.get("store","")
+    user = st.session_state.get("user") or {}
+    if not has_perm(user, "SANXUAT"):
+        st.warning("⛔ Bạn không có quyền vào mục Sản xuất.")
+        return
+    store = st.session_state.get("store","HOSEN")
 
-    tab_cot, tab_mut_tc, tab_mut_ct = st.tabs(["Thành phẩm CỐT", "Mứt từ TRÁI CÂY", "Mứt từ CỐT"])
+    tabs = []
+    show_ct = has_perm(user, "CT_EDIT")
+    if show_ct:
+        tabs = st.tabs(["🧪 Công thức (CRUD)", "CỐT", "MỨT từ TRÁI CÂY", "MỨT từ CỐT"])
+    else:
+        tabs = st.tabs(["CỐT", "MỨT từ TRÁI CÂY", "MỨT từ CỐT"])
 
-    # ======== 1) CỐT ========
-    with tab_cot:
+    # Tab 0: Công thức (nếu có quyền)
+    idx = 0
+    if show_ct:
+        with tabs[0]:
+            page_congthuc(conn)
+        idx = 1
+
+    # ======== CỐT ========
+    with tabs[idx+0]:
         st.subheader("SX CỐT (có hệ số thu hồi)")
         cts = fetch_df(conn, "SELECT * FROM formulas WHERE type='COT' ORDER BY code")
         ct_pick = st.selectbox("Chọn CT CỐT", cts["code"].tolist() if not cts.empty else [])
+        ts = st.date_input("Ngày ghi sổ", datetime.today().date(), key="prd_cot_dt")
         if ct_pick:
             row = cts[cts["code"]==ct_pick].iloc[0].to_dict()
             out_p = row["output_pcode"]
@@ -987,310 +1086,246 @@ def page_sanxuat(conn):
             raws  = [x for x in (row["fruits_csv"] or "").split(",") if x]
             adds  = json.loads(row["additives_json"] or "{}")
 
-            kg_sau_so = st.number_input("KG sau sơ chế (đầu vào)", 0.0, step=0.1)
-            kg_tp     = st.number_input("KG thành phẩm (tính theo hệ số)", value=kg_sau_so*rec, step=0.1)
-            st.caption(f"Hệ số thu hồi = {rec}. Cốc/1kg TP = {cups}.")
+            kg_sau_so = st.number_input("KG sau sơ chế (đầu vào)", 0.0, step=0.1, key="cot_in")
+            kg_tp     = st.number_input("KG thành phẩm (auto = kg_sau_sơ × hệ số)", value=kg_sau_so*rec, step=0.1, key="cot_out")
+            st.caption(f"HS thu hồi = {rec:.2f} • Cốc/1kg TP = {cups:.2f}")
 
             if st.button("✅ Ghi sổ SX CỐT"):
-                # Xuất NVL: chia đều theo số NVL chính (có thể nâng cấp thêm định mức riêng từng NVL nếu có)
+                # Xuất NVL chính chia đều; phụ gia theo kg_sau_so
+                consume = {}
                 n = max(1, len(raws))
-                consume = {r: (kg_sau_so / n) for r in raws}
-                # Phụ gia: định lượng theo kg sau sơ
+                for r in raws:
+                    consume[r] = consume.get(r,0.0) + (kg_sau_so / n)
                 for pg, per1 in adds.items():
-                    consume[pg] = consume.get(pg, 0.0) + float(per1 or 0.0) * kg_sau_so
-                _consume_materials(conn, store, consume, ref=f"PRD_COT:{ct_pick}")
+                    consume[pg] = consume.get(pg,0.0) + float(per1 or 0.0)*kg_sau_so
+                _consume_materials(conn, store, ts, consume, ref=f"PRD_COT:{ct_pick}")
 
-                # Giá thành TP = bình quân đơn giá NVL chính (ước tính)
                 unit_cost = _avg_cost_from_raws(conn, store, raws)
-                _receive_finish(conn, store, out_p, kg_tp, unit_cost, cups_per_kg=cups, ref=f"PRD_COT:{ct_pick}")
+                _receive_finish(conn, store, ts, out_p, kg_tp, unit_cost, cups_per_kg=cups, ref=f"PRD_COT:{ct_pick}")
 
-                log_action(conn, st.session_state["user"]["email"], "PRD_COT", f"{ct_pick} -> {out_p} {kg_tp}kg @~{unit_cost}")
-                st.success("Đã ghi sổ SX CỐT & nhập kho thành phẩm.")
+                log_action(conn, user["email"], "PRD_COT", f"{ct_pick} -> {out_p} {kg_tp}kg @~{unit_cost}")
+                st.success("✅ Đã ghi sổ SX CỐT & nhập kho TP.")
                 st.experimental_rerun()
 
-    # ======== 2) MỨT từ TRÁI CÂY ========
-    with tab_mut_tc:
+    # ======== MỨT từ TRÁI CÂY ========
+    with tabs[idx+1]:
         st.subheader("SX MỨT (nguồn TRÁI CÂY) — KHÔNG có hệ số thu hồi")
-        cts = fetch_df(conn, "SELECT * FROM formulas WHERE type='MUT' AND (note LIKE 'SRC=TRAI_CAY%' OR note='' OR note IS NULL) ORDER BY code")
+        cts = fetch_df(conn, "SELECT * FROM formulas WHERE type='MUT' AND (note LIKE 'SRC=TRÁI_CÂY%' OR note='' OR note IS NULL) ORDER BY code")
         ct_pick = st.selectbox("Chọn CT MỨT (TRÁI CÂY)", cts["code"].tolist() if not cts.empty else [], key="ct_mut_tc")
+        ts2 = st.date_input("Ngày ghi sổ", datetime.today().date(), key="prd_mut_tc_dt")
         if ct_pick:
             row = cts[cts["code"]==ct_pick].iloc[0].to_dict()
             out_p = row["output_pcode"]
             cups  = float(row["cups_per_kg"] or 0.0)
-            raws  = [x for x in (row["fruits_csv"] or "").split(",") if x]   # trái cây
+            raws  = [x for x in (row["fruits_csv"] or "").split(",") if x]  # trái cây
             adds  = json.loads(row["additives_json"] or "{}")
 
-            kg_sau_so = st.number_input("KG sau sơ chế (đầu vào)", 0.0, step=0.1, key="mut_tc_in")
-            kg_tp     = st.number_input("KG thành phẩm MỨT", 0.0, step=0.1, key="mut_tc_out")
+            kg_in  = st.number_input("KG sau sơ chế (đầu vào)", 0.0, step=0.1, key="mut_tc_in")
+            kg_out = st.number_input("KG thành phẩm MỨT", 0.0, step=0.1, key="mut_tc_out")
 
-            if st.button("✅ Ghi sổ SX MỨT (trái cây)"):
+            if st.button("✅ Ghi sổ SX MỨT (TRÁI CÂY)"):
+                consume = {}
                 n = max(1, len(raws))
-                consume = {r: (kg_sau_so / n) for r in raws}
+                for r in raws:
+                    consume[r] = consume.get(r,0.0) + (kg_in / n)
                 for pg, per1 in adds.items():
-                    consume[pg] = consume.get(pg, 0.0) + float(per1 or 0.0) * kg_sau_so
-                _consume_materials(conn, store, consume, ref=f"PRD_MUT_TC:{ct_pick}")
+                    consume[pg] = consume.get(pg,0.0) + float(per1 or 0.0)*kg_in
+                _consume_materials(conn, store, ts2, consume, ref=f"PRD_MUT_TC:{ct_pick}")
 
                 unit_cost = _avg_cost_from_raws(conn, store, raws)
-                _receive_finish(conn, store, out_p, kg_tp, unit_cost, cups_per_kg=cups, ref=f"PRD_MUT_TC:{ct_pick}")
+                _receive_finish(conn, store, ts2, out_p, kg_out, unit_cost, cups_per_kg=cups, ref=f"PRD_MUT_TC:{ct_pick}")
 
-                log_action(conn, st.session_state["user"]["email"], "PRD_MUT_TC", f"{ct_pick} -> {out_p} {kg_tp}kg @~{unit_cost}")
-                st.success("Đã ghi sổ SX MỨT (TRÁI CÂY) & nhập kho.")
+                log_action(conn, user["email"], "PRD_MUT_TC", f"{ct_pick} -> {out_p} {kg_out}kg @~{unit_cost}")
+                st.success("✅ Đã ghi sổ SX MỨT (TRÁI CÂY) & nhập kho.")
                 st.experimental_rerun()
 
-    # ======== 3) MỨT từ CỐT ========
-    with tab_mut_ct:
+    # ======== MỨT từ CỐT ========
+    with tabs[idx+2]:
         st.subheader("SX MỨT (nguồn CỐT) — KHÔNG có hệ số thu hồi")
-        cts = fetch_df(conn, "SELECT * FROM formulas WHERE type='MUT' AND note LIKE 'SRC=COT%' ORDER BY code")
+        cts = fetch_df(conn, "SELECT * FROM formulas WHERE type='MUT' AND note LIKE 'SRC=CỐT%' ORDER BY code")
+        # Nếu trước đây note lưu 'SRC=COT', cố gắng hiển thị thêm:
+        if cts.empty:
+            cts = fetch_df(conn, "SELECT * FROM formulas WHERE type='MUT' AND note LIKE 'SRC=COT%' ORDER BY code")
         ct_pick = st.selectbox("Chọn CT MỨT (CỐT)", cts["code"].tolist() if not cts.empty else [], key="ct_mut_ct")
+        ts3 = st.date_input("Ngày ghi sổ", datetime.today().date(), key="prd_mut_ct_dt")
         if ct_pick:
             row = cts[cts["code"]==ct_pick].iloc[0].to_dict()
             out_p = row["output_pcode"]
             cups  = float(row["cups_per_kg"] or 0.0)
-            raws  = [x for x in (row["fruits_csv"] or "").split(",") if x]   # danh mục CỐT dùng làm NVL
+            raws  = [x for x in (row["fruits_csv"] or "").split(",") if x]  # danh mục CỐT dùng làm NVL
             adds  = json.loads(row["additives_json"] or "{}")
 
-            kg_cot = st.number_input("KG CỐT dùng", 0.0, step=0.1)
-            kg_tp  = st.number_input("KG thành phẩm MỨT", 0.0, step=0.1)
+            kg_cot = st.number_input("KG CỐT dùng", 0.0, step=0.1, key="mut_ct_in")
+            kg_out = st.number_input("KG thành phẩm MỨT", 0.0, step=0.1, key="mut_ct_out")
 
             if st.button("✅ Ghi sổ SX MỨT (CỐT)"):
+                consume = {}
                 n = max(1, len(raws))
-                consume = {r: (kg_cot / n) for r in raws}
+                for r in raws:
+                    consume[r] = consume.get(r,0.0) + (kg_cot / n)
                 for pg, per1 in adds.items():
-                    consume[pg] = consume.get(pg, 0.0) + float(per1 or 0.0) * kg_cot
-                _consume_materials(conn, store, consume, ref=f"PRD_MUT_CT:{ct_pick}")
+                    consume[pg] = consume.get(pg,0.0) + float(per1 or 0.0)*kg_cot
+                _consume_materials(conn, store, ts3, consume, ref=f"PRD_MUT_CT:{ct_pick}")
 
-                unit_cost = _avg_cost_from_raws(conn, store, raws)  # bình quân đơn giá các CỐT dùng
-                _receive_finish(conn, store, out_p, kg_tp, unit_cost, cups_per_kg=cups, ref=f"PRD_MUT_CT:{ct_pick}")
+                unit_cost = _avg_cost_from_raws(conn, store, raws)
+                _receive_finish(conn, store, ts3, out_p, kg_out, unit_cost, cups_per_kg=cups, ref=f"PRD_MUT_CT:{ct_pick}")
 
-                log_action(conn, st.session_state["user"]["email"], "PRD_MUT_CT", f"{ct_pick} -> {out_p} {kg_tp}kg @~{unit_cost}")
-                st.success("Đã ghi sổ SX MỨT (CỐT) & nhập kho.")
+                log_action(conn, user["email"], "PRD_MUT_CT", f"{ct_pick} -> {out_p} {kg_out}kg @~{unit_cost}")
+                st.success("✅ Đã ghi sổ SX MỨT (CỐT) & nhập kho.")
                 st.experimental_rerun()
+
+# =============== Router cập nhật (thêm Sản xuất) ===============
+if _menu == "Sản xuất":
+    page_sanxuat(conn)
+elif _menu == "Danh mục":
+    page_danhmuc(conn)
+elif _menu == "Kho":
+    page_kho(conn)
+elif _menu == "Báo cáo":
+    page_baocao(conn)
 # =========================
-# app.py — PART 5/5 (Doanh thu + TSCD + Dashboard + Main)
+# app.py — PART 5/5 (Doanh thu, TSCD, Nhật ký, Dashboard)
 # =========================
 
-# ---- Nâng cấp bảng revenue để tương thích báo cáo nâng cao (Phần 3) ----
-def ensure_revenue_enhanced(conn):
-    # Thêm cột nếu thiếu: pcode, qty, unit_price (để query qty*unit_price không lỗi)
-    try:
-        run_sql(conn, "ALTER TABLE revenue ADD COLUMN pcode TEXT")
-    except Exception:
-        pass
-    try:
-        run_sql(conn, "ALTER TABLE revenue ADD COLUMN qty DOUBLE PRECISION")
-    except Exception:
-        pass
-    try:
-        run_sql(conn, "ALTER TABLE revenue ADD COLUMN unit_price DOUBLE PRECISION")
-    except Exception:
-        pass
-
-# ---- Doanh thu: 2 chế độ nhập ----
+# ---------- DOANH THU ----------
 def page_doanhthu(conn):
-    st.header("💵 Doanh thu")
-    ensure_revenue_enhanced(conn)
-    store = st.session_state.get("store","")
+    st.header("💰 Doanh thu (CASH / BANK)")
+    store = st.session_state.get("store","HOSEN")
 
-    tab_simple, tab_detail = st.tabs(["Ghi tổng tiền (CASH/BANK)", "Ghi chi tiết theo SP (tùy chọn)"])
+    tab_rec, tab_hist = st.tabs(["Ghi doanh thu", "Lịch sử"])
 
-    # ----- 1) Ghi tổng tiền -----
-    with tab_simple:
-        st.subheader("Ghi tổng tiền theo ngày & phương thức")
-        d = st.date_input("Ngày", date.today(), key="rev_d")
-        pay = st.selectbox("Thanh toán", ["CASH","BANK"], key="rev_pay")
-        amt = st.number_input("Số tiền (VND)", 0.0, step=1000.0, key="rev_amt")
-        note = st.text_input("Ghi chú", key="rev_note")
-        if st.button("💾 Lưu (tổng tiền)"):
-            run_sql(conn, """
-                INSERT INTO revenue(ts,store,amount,pay_method,pcode,qty,unit_price,note)
-                VALUES (?,?,?,?,?,?,?,?)
-            """, (d, store, amt, pay, None, None, None, note))
-            log_action(conn, st.session_state["user"]["email"], "REV_ADD_SUM", f"{d} {pay} {amt}")
-            st.success("Đã lưu")
-            st.experimental_rerun()
+    with tab_rec:
+        ngay = st.date_input("Ngày", datetime.today().date(), key="rev_ngay")
+        amount = st.number_input("Số tiền (VND)", 0.0, step=1000.0, min_value=0.0)
+        pay = st.radio("Hình thức", ["CASH","BANK"], horizontal=True)
+        note = st.text_input("Ghi chú (tuỳ chọn)")
+        # optional chi tiết SP
+        with st.expander("➕ Chi tiết sản phẩm (tùy chọn)"):
+            prods, fmt = _prod_select(conn, ["TRAI_CÂY","PHU_GIA","COT","MUT","KHAC"])
+            p = st.selectbox("SP (tùy chọn)", [""]+prods, format_func=lambda x: fmt(x) if x else "")
+            q = st.number_input("Số lượng", 0.0, step=0.1, min_value=0.0)
+            uprice = st.number_input("Đơn giá bán (VND/kg)", 0.0, step=1000.0, min_value=0.0)
 
-        st.markdown("**Nhật ký (30 ngày gần đây)**")
-        df = fetch_df(conn, """
-            SELECT ts, pay_method, amount, note
-            FROM revenue
-            WHERE store=? AND ts>=?
-            ORDER BY ts DESC
-        """, (store, (date.today() - timedelta(days=30)).strftime("%Y-%m-%d")))
-        st.dataframe(df, use_container_width=True)
-
-    # ----- 2) Ghi chi tiết theo SP (phục vụ báo cáo nâng cao/COGS) -----
-    with tab_detail:
-        st.subheader("Ghi theo sản phẩm (tùy chọn)")
-        d2 = st.date_input("Ngày", date.today(), key="rev2_d")
-        pay2 = st.selectbox("Thanh toán", ["CASH","BANK"], key="rev2_pay")
-        # chọn SP
-        kw = st.text_input("Tìm SP", key="rev2_kw")
-        opts = product_list(conn, keyword=kw)
-        def fmt(m):
-            if opts.empty or m not in opts["code"].values: return m
-            return f"{m} — {opts.set_index('code').loc[m,'name']}"
-        pcode = st.selectbox("Sản phẩm", opts["code"].tolist() if not opts.empty else [], format_func=fmt)
-        qty = st.number_input("Số lượng", 0.0, step=0.1, key="rev2_qty")
-        unit_price = st.number_input("Đơn giá bán (VND/ĐVT)", 0.0, step=500.0, key="rev2_price")
-        note2 = st.text_input("Ghi chú", key="rev2_note")
-
-        colA, colB = st.columns(2)
-        with colA:
-            if st.button("💾 Lưu (chi tiết SP)"):
-                amount = qty * unit_price
+        if st.button("💾 Ghi doanh thu"):
+            if amount <= 0:
+                st.error("⚠️ Nhập số tiền > 0.")
+            else:
                 run_sql(conn, """
                     INSERT INTO revenue(ts,store,amount,pay_method,pcode,qty,unit_price,note)
-                    VALUES (?,?,?,?,?,?,?,?)
-                """, (d2, store, amount, pay2, pcode, qty, unit_price, note2))
-                log_action(conn, st.session_state["user"]["email"], "REV_ADD_DETAIL", f"{d2} {pcode} {qty} x {unit_price}")
-                st.success("Đã lưu")
+                    VALUES(:d,:s,:a,:pm,:p,:q,:u,:no)
+                """, {"d": ngay.strftime("%Y-%m-%d"), "s": store, "a": amount, "pm": pay,
+                      "p": (p if p else None), "q": (q if q>0 else None),
+                      "u": (uprice if uprice>0 else None), "no": note})
+                log_action(conn, st.session_state["user"]["email"], "REV_ADD", f"{amount} {pay}")
+                st.success("✅ Đã ghi doanh thu.")
                 st.experimental_rerun()
-        with colB:
-            # xuất CSV nhanh để kiểm tra
-            dfrom = st.date_input("Từ ngày", date.today().replace(day=1), key="rev2_from")
-            dto   = st.date_input("Đến ngày", date.today(), key="rev2_to")
-            df2 = fetch_df(conn, """
-                SELECT ts, pcode, qty, unit_price, amount, pay_method, note
-                FROM revenue
-                WHERE store=? AND ts BETWEEN ? AND ?
-                ORDER BY ts DESC
-            """, (store, dfrom.strftime("%Y-%m-%d"), dto.strftime("%Y-%m-%d")))
-            st.dataframe(df2, use_container_width=True)
-            if not df2.empty:
-                st.download_button("⬇️ Export CSV", df2.to_csv(index=False).encode("utf-8"),
-                                   file_name=f"revenue_detail_{dfrom}_{dto}.csv", mime="text/csv")
 
-# ---- TSCD ----
+    with tab_hist:
+        fr = st.date_input("Từ ngày", datetime.today().date().replace(day=1), key="rev_fr")
+        to = st.date_input("Đến ngày", datetime.today().date(), key="rev_to")
+        df = fetch_df(conn, """
+            SELECT ts::date AS ngay, pay_method, amount, pcode, qty, unit_price, note
+            FROM revenue
+            WHERE store=:s AND ts BETWEEN :fr AND :to
+            ORDER BY ts DESC
+        """, {"s": store, "fr": fr.strftime("%Y-%m-%d"), "to": to.strftime("%Y-%m-%d")})
+        st.dataframe(df, use_container_width=True, height=380)
+        if not df.empty:
+            st.download_button("⬇️ Xuất CSV", df.to_csv(index=False).encode("utf-8"),
+                               file_name=f"doanhthu_{fr}_{to}.csv", mime="text/csv")
+
+# ---------- TSCD ----------
 def page_tscd(conn):
-    st.header("🏗️ Tài sản cố định")
-    df = fetch_df(conn, "SELECT id,name,cost,dep_per_month,buy_date FROM tscd ORDER BY id DESC")
-    st.dataframe(df, use_container_width=True)
+    st.header("🏗️ Tài sản cố định (TSCD)")
+    df = fetch_df(conn, "SELECT * FROM tscd ORDER BY buy_date DESC")
+    st.dataframe(df, use_container_width=True, height=320)
 
-    c1,c2,c3,c4 = st.columns(4)
-    with c1:
-        name = st.text_input("Tên TS")
-    with c2:
-        cost = st.number_input("Nguyên giá", 0.0, step=100000.0)
-    with c3:
-        dep = st.number_input("Khấu hao/tháng", 0.0, step=10000.0)
-    with c4:
-        buy = st.date_input("Ngày mua", date.today())
-
-    if st.button("💾 Thêm TSCD"):
-        run_sql(conn, "INSERT INTO tscd(name,cost,dep_per_month,buy_date) VALUES(?,?,?,?)",
-                (name, cost, dep, buy))
-        log_action(conn, st.session_state["user"]["email"], "TSCD_ADD", name)
-        st.success("Đã lưu"); st.experimental_rerun()
-
-    # Tổng hợp nhanh
-    st.subheader("Tổng hợp khấu hao & giá trị ròng (ước tính)")
-    def months_between(d0: date, d1: date) -> int:
-        return max(0, (d1.year - d0.year)*12 + (d1.month - d0.month))
-    today = date.today()
-    kh_lk = 0.0; ng = 0.0
-    for _, r in df.iterrows():
-        ng += float(r["cost"] or 0.0)
-        kh_lk += min(float(r["cost"] or 0.0), months_between(pd.to_datetime(r["buy_date"]).date(), today) * float(r["dep_per_month"] or 0.0))
-    st.metric("Nguyên giá", f"{ng:,.0f} VND")
-    st.metric("Khấu hao lũy kế (ước)", f"{kh_lk:,.0f} VND")
-    st.metric("Giá trị ròng", f"{max(0.0, ng - kh_lk):,.0f} VND")
-
-# ---- Dashboard ----
-def page_dashboard(conn):
-    st.title("🧃 Fruit Tea ERP v5 – Dashboard")
-    store = st.session_state.get("store","")
-
-    col1, col2, col3 = st.columns(3)
-
-    # Giá trị tồn kho (đến hôm nay)
-    inv = fetch_df(conn, """
-        SELECT pcode, kind, qty, price_in, ts
-        FROM inventory_ledger
-        WHERE store=? ORDER BY ts
-    """, (store,))
-    avg_cost_map, stock_map = {}, {}
-    for _, r in inv.iterrows():
-        p=r["pcode"]; q=float(r["qty"] or 0); k=r["kind"]; pr=float(r["price_in"] or 0)
-        if p not in stock_map: stock_map[p]=0.0; avg_cost_map[p]=0.0
-        if k=="IN":
-            total=avg_cost_map[p]*stock_map[p]+pr*q
-            stock_map[p]+=q
-            avg_cost_map[p]=(total/stock_map[p]) if stock_map[p]>0 else 0.0
+    with st.form("tscd_form"):
+        name = st.text_input("Tên tài sản*")
+        cost = st.number_input("Nguyên giá (VND)", 0.0, step=1000.0)
+        dep  = st.number_input("Khấu hao/tháng (VND)", 0.0, step=1000.0)
+        bdate= st.date_input("Ngày mua", datetime.today().date())
+        ok = st.form_submit_button("💾 Lưu")
+    if ok:
+        if not name or cost<=0:
+            st.error("Tên & nguyên giá bắt buộc.")
         else:
-            stock_map[p]-=q
-            if stock_map[p]<0: stock_map[p]=0.0
-    total_value = sum(max(0.0, stock_map.get(p,0.0))*avg_cost_map.get(p,0.0) for p in stock_map)
+            run_sql(conn, """
+                INSERT INTO tscd(name,cost,dep_per_month,buy_date)
+                VALUES(:n,:c,:d,:b)
+            """, {"n": name, "c": cost, "d": dep, "b": bdate.strftime("%Y-%m-%d")})
+            log_action(conn, st.session_state["user"]["email"], "TSCD_ADD", name)
+            st.success("✅ Đã thêm TSCD.")
+            st.experimental_rerun()
 
-    # Doanh thu 14 ngày gần nhất (tổng amount)
-    df_rev = fetch_df(conn, """
-        SELECT ts::date d, SUM(COALESCE(amount,0)) amount
+# ---------- NHẬT KÝ HỆ THỐNG ----------
+def page_syslog(conn):
+    st.header("📜 Nhật ký hệ thống")
+    fr = st.date_input("Từ ngày", datetime.today().date()-timedelta(days=7), key="log_fr")
+    to = st.date_input("Đến ngày", datetime.today().date(), key="log_to")
+    df = fetch_df(conn, """
+        SELECT ts::timestamp(0) AS ts, user_email, action, detail
+        FROM syslog
+        WHERE ts BETWEEN :fr AND :to
+        ORDER BY ts DESC
+        LIMIT 500
+    """, {"fr": fr.strftime("%Y-%m-%d"), "to": to.strftime("%Y-%m-%d")})
+    st.dataframe(df, use_container_width=True, height=380)
+    if not df.empty:
+        st.download_button("⬇️ Xuất CSV", df.to_csv(index=False).encode("utf-8"),
+                           file_name=f"syslog_{fr}_{to}.csv", mime="text/csv")
+
+# ---------- DASHBOARD ----------
+def page_dashboard(conn):
+    st.header("📊 Dashboard tổng quan")
+    store = st.session_state.get("store","HOSEN")
+
+    # Doanh thu 7 ngày
+    rev7 = fetch_df(conn, """
+        SELECT ts::date AS d, SUM(amount) AS amount
         FROM revenue
-        WHERE store=? AND ts>=?
-        GROUP BY ts::date
-        ORDER BY d
-    """, (store, (date.today()-timedelta(days=13)).strftime("%Y-%m-%d")))
-    rev_today = float(df_rev[df_rev["d"]==pd.to_datetime(date.today())]["amount"].sum()) if not df_rev.empty else 0.0
-
-    col1.metric("Giá trị tồn kho", f"{total_value:,.0f} VND")
-    col2.metric("Doanh thu hôm nay", f"{rev_today:,.0f} VND")
-    col3.metric("Cửa hàng hiện tại", st.session_state.get("store",""))
-
-    st.subheader("Doanh thu 14 ngày gần nhất")
-    if not df_rev.empty:
-        st.line_chart(df_rev.set_index("d")["amount"])
+        WHERE store=:s AND ts >= NOW() - interval '7 day'
+        GROUP BY d ORDER BY d
+    """, {"s": store})
+    st.subheader("Doanh thu 7 ngày")
+    if not rev7.empty:
+        st.line_chart(rev7.set_index("d"))
     else:
         st.info("Chưa có dữ liệu doanh thu.")
 
-# ---- Menu & main() ----
-def main_app():
-    # Đảm bảo schema & nâng cấp revenue
-    ensure_min_schema(conn)
-    ensure_revenue_enhanced(conn)
-
-    user = require_login(conn)
-
-    # Sidebar
-    with st.sidebar:
-        st.markdown(f"**👤 {user.get('display','')}**  \n`{user.get('email','')}`")
-        st.markdown("---")
-        menu = st.radio("Menu", [
-            "Dashboard",
-            "Danh mục",
-            "Kho",
-            "Sản xuất",
-            "Doanh thu",
-            "Báo cáo",
-            "TSCD",
-            "Nhật ký",
-            "Đăng xuất"
-        ])
-        st.markdown("---")
-        st.caption("DB: " + ("Postgres" if os.getenv("DATABASE_URL") else "SQLite"))
-
-    # Router
-    if menu == "Dashboard":
-        page_dashboard(conn)
-    elif menu == "Danh mục":
-        page_danhmuc(conn)
-    elif menu == "Kho":
-        page_kho(conn)
-    elif menu == "Sản xuất":
-        page_sanxuat(conn)
-    elif menu == "Doanh thu":
-        page_doanhthu(conn)
-    elif menu == "Báo cáo":
-        page_baocao(conn)
-    elif menu == "TSCD":
-        page_tscd(conn)
-    elif menu == "Nhật ký":
-        st.header("🧾 Nhật ký hệ thống")
-        df = fetch_df(conn, "SELECT ts,actor,action,detail FROM syslog ORDER BY ts DESC LIMIT 500")
-        st.dataframe(df, use_container_width=True)
+    # Tồn kho hiện tại
+    ton = stock_snapshot(conn, store, datetime.today().date())
+    st.subheader("Top tồn kho (theo giá trị)")
+    if not ton.empty:
+        st.dataframe(ton.sort_values("value", ascending=False).head(10), use_container_width=True)
     else:
-        log_action(conn, user["email"], "LOGOUT", "")
-        st.session_state.clear()
-        st.experimental_rerun()
+        st.info("Chưa có dữ liệu tồn kho.")
 
-# ---- Entry point ----
-if __name__ == "__main__":
-    main_app()
+    # TSCD
+    df_t = fetch_df(conn, "SELECT COUNT(*) AS n, COALESCE(SUM(cost),0) AS total FROM tscd")
+    if not df_t.empty:
+        n = int(df_t.iloc[0]["n"]); val = float(df_t.iloc[0]["total"])
+        st.metric("TSCD đã ghi nhận", n, help=f"Tổng nguyên giá: {val:,.0f} VND")
+
+# ---------- Router tổng (cuối cùng) ----------
+if _menu == "Dashboard":
+    page_dashboard(conn)
+elif _menu == "Danh mục":
+    page_danhmuc(conn)
+elif _menu == "Kho":
+    page_kho(conn)
+elif _menu == "Sản xuất":
+    page_sanxuat(conn)
+elif _menu == "Doanh thu":
+    page_doanhthu(conn)
+elif _menu == "Báo cáo":
+    page_baocao(conn)
+elif _menu == "TSCD":
+    page_tscd(conn)
+elif _menu == "Nhật ký":
+    page_syslog(conn)
+elif _menu == "Đăng xuất":
+    log_action(conn, st.session_state["user"]["email"], "LOGOUT", "")
+    st.session_state.clear()
+    st.experimental_rerun()
+
