@@ -669,3 +669,549 @@ def router():
         st.info("TSCD sẽ ở **Phần 4**.")
     elif menu == "Doanh thu":
         st.info("Doanh thu sẽ ở **Phần 5**.")
+# ============================================================
+# PHẦN 3/5 — KHO (Nhập/Xuất/Tồn/KK) + SẢN XUẤT (CỐT & MỨT)
+# ============================================================
+
+# ========= Helpers riêng cho Kho/SX =========
+def _get_products(conn, cat=None):
+    if cat:
+        return fetch_df(conn, "SELECT code,name,uom,cat_code FROM products WHERE cat_code=:c ORDER BY code", {"c": cat})
+    return fetch_df(conn, "SELECT code,name,uom,cat_code FROM products ORDER BY code")
+
+def _product_selector(conn, cat=None, placeholder="Chọn sản phẩm...", key_prefix=""):
+    df = _get_products(conn, cat)
+    opts = [f"{r.code} — {r.name} ({r.uom})" for _, r in df.iterrows()]
+    lb = st.selectbox(placeholder, opts, index=0 if opts else None, key=f"{key_prefix}p")
+    code = lb.split(" — ", 1)[0] if lb else None
+    uom = df[df["code"] == code]["uom"].iloc[0] if (lb and not df.empty) else ""
+    return code, uom
+
+def _cups_per_kg_for_pcode(conn, pcode: str) -> float:
+    """Lấy cốc/kg TP từ công thức – ưu tiên công thức mới nhất của đúng pcode."""
+    try:
+        df = fetch_df(conn, """
+            SELECT cups_per_kg FROM formulas
+            WHERE output_pcode=:p ORDER BY code DESC LIMIT 1
+        """, {"p": pcode})
+        return float(df.iloc[0]["cups_per_kg"]) if not df.empty else 0.0
+    except Exception:
+        return 0.0
+
+def _stock_of(conn, store: str, pcode: str, to_dt: date | None = None):
+    """Tồn & cốc đến hết ngày to_dt (nếu None => tới hiện tại)."""
+    if to_dt is None:
+        to_dt = date.today()
+    df = fetch_df(conn, """
+        SELECT
+          SUM(CASE WHEN kind='IN'  THEN qty ELSE -qty END)  AS qty,
+          SUM(CASE WHEN kind='IN'  THEN COALESCE(cups,0) ELSE -COALESCE(cups,0) END) AS cups,
+          SUM(CASE WHEN kind='IN'  THEN qty*COALESCE(price_in,0) ELSE 0 END)         AS val_in
+        FROM inventory_ledger
+        WHERE store=:s AND pcode=:p AND ts::date<=:d
+    """, {"s": store, "p": pcode, "d": to_dt})
+    if df.empty:
+        return 0.0, 0.0, 0.0
+    q = float(df.iloc[0]["qty"] or 0.0)
+    c = float(df.iloc[0]["cups"] or 0.0)
+    v = float(df.iloc[0]["val_in"] or 0.0)
+    return q, c, v
+
+def _snapshot_stock(conn, store: str, to_dt: date | None = None, cat: str | None = None):
+    if to_dt is None: to_dt = date.today()
+    cond_cat = "" if not cat else "AND p.cat_code=:cat"
+    sql = f"""
+      SELECT p.code, p.name, p.cat_code, p.uom,
+             COALESCE(SUM(CASE WHEN l.kind='IN'  THEN l.qty ELSE -l.qty END),0)        AS qty,
+             COALESCE(SUM(CASE WHEN l.kind='IN'  THEN COALESCE(l.cups,0)
+                               ELSE -COALESCE(l.cups,0) END),0)                         AS cups,
+             COALESCE(SUM(CASE WHEN l.kind='IN'  THEN l.qty*COALESCE(l.price_in,0)
+                               ELSE 0 END),0)                                           AS total_in_value
+      FROM products p
+      LEFT JOIN inventory_ledger l
+             ON l.pcode=p.code AND l.store=:s AND l.ts::date<=:d
+      WHERE 1=1 {cond_cat}
+      GROUP BY p.code,p.name,p.cat_code,p.uom
+      HAVING COALESCE(SUM(CASE WHEN l.kind='IN' THEN l.qty ELSE -l.qty END),0)<>0
+          OR COALESCE(SUM(CASE WHEN l.kind='IN' THEN COALESCE(l.cups,0)
+                               ELSE -COALESCE(l.cups,0) END),0)<>0
+      ORDER BY p.code
+    """
+    params = {"s": store, "d": to_dt}
+    if cat: params["cat"] = cat
+    return fetch_df(conn, sql, params)
+
+def _prevent_negative(conn, store: str, pcode: str, qty_out: float):
+    stock, _, _ = _stock_of(conn, store, pcode)
+    return qty_out <= stock + 1e-9
+
+def _new_batch_id(conn, store: str, typ: str):
+    df = fetch_df(conn, "SELECT TO_CHAR(NOW(),'YYMMDDHH24MISS') AS t")
+    t = df.iloc[0]["t"]
+    return f"{store}-{typ}-{t}"
+
+# =============== KHO ===============
+def page_kho(conn: Connection, user: dict):
+    st.markdown("### 🧳 Quản lý kho")
+    tabs = st.tabs(["🧾 Phiếu nhập", "📤 Phiếu xuất", "📦 Tồn kho", "🧮 Kiểm kê nâng cao"])
+
+    # ---------- Phiếu nhập ----------
+    with tabs[0]:
+        st.subheader("🧾 Phiếu nhập")
+        if not has_perm(user, "WH_IN"):
+            st.warning("Bạn không có quyền nhập kho (WH_IN).")
+        else:
+            col1, col2, col3 = st.columns([1.2, 2, 1])
+            with col1:
+                in_date = st.date_input("Ngày nhập", value=date.today(), key="in_date")
+            with col2:
+                _ = st.text_input("Gõ vài ký tự để lọc…", key="in_find")
+            with col3:
+                store = st.session_state.get("store") or st.selectbox(
+                    "Cửa hàng", fetch_df(conn, "SELECT code FROM stores ORDER BY code")["code"].tolist(),
+                    key="in_store_select"
+                )
+            st.caption("Chọn sản phẩm nhập")
+            pcode, uom = _product_selector(conn, placeholder="— chọn sản phẩm —", key_prefix="in_")
+            c1, c2, c3 = st.columns([1, 1, 2])
+            with c1:
+                qty = st.number_input("Số lượng", value=0.0, step=0.1, min_value=0.0, key="in_qty")
+            with c2:
+                price = st.number_input("Đơn giá nhập (VND/ĐVT)", value=0.0, step=100.0, min_value=0.0, key="in_price")
+            with c3:
+                note = st.text_input("Ghi chú", key="in_note")
+
+            # Cốc: chỉ hiển thị nếu người dùng muốn tự nhập cho CỐT/MỨT; mặc định để 0 – SX sẽ tính tự động
+            manual_cups = st.checkbox("Nhập số cốc thủ công (chỉ khi nhập thành phẩm CỐT/MỨT)", key="in_cup_manual")
+            cups_in = 0.0
+            if manual_cups and pcode:
+                cups_in = st.number_input("Số cốc (+)", value=0.0, step=1.0, min_value=0.0, key="in_cups")
+
+            if st.button("💾 Lưu phiếu nhập", type="primary", key="in_btn"):
+                if not pcode or qty <= 0:
+                    st.error("Chọn sản phẩm và số lượng > 0.")
+                else:
+                    run_sql(conn, """
+                        INSERT INTO inventory_ledger(ts, store, pcode, kind, qty, price_in, reason, cups)
+                        VALUES (NOW(), :s, :p, 'IN', :q, :pr, :rs, :cups)
+                    """, {"s": store, "p": pcode, "q": qty, "pr": price, "rs": note, "cups": cups_in})
+                    write_audit(conn, "WH_IN", f"{store} {pcode} +{qty} {uom} ({price}) cups+{cups_in}")
+                    st.success("Đã lưu phiếu nhập.")
+
+    # ---------- Phiếu xuất ----------
+    with tabs[1]:
+        st.subheader("📤 Phiếu xuất")
+        if not has_perm(user, "WH_OUT"):
+            st.warning("Bạn không có quyền xuất kho (WH_OUT).")
+        else:
+            col1, col2, col3 = st.columns([1.2, 2, 1])
+            with col1:
+                out_date = st.date_input("Ngày xuất", value=date.today(), key="out_date")
+            with col2:
+                _ = st.text_input("Gõ vài ký tự để lọc…", key="out_find")
+            with col3:
+                store = st.session_state.get("store") or st.selectbox(
+                    "Cửa hàng", fetch_df(conn, "SELECT code FROM stores ORDER BY code")["code"].tolist(),
+                    key="out_store_select"
+                )
+            st.caption("Chọn sản phẩm xuất")
+            pcode, uom = _product_selector(conn, placeholder="— chọn sản phẩm —", key_prefix="out_")
+
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                qty = st.number_input("Số lượng", value=0.0, step=0.1, min_value=0.0, key="out_qty")
+            with c2:
+                reason = st.selectbox("Lý do xuất", ["BÁN_LẺ", "BÁN_SỈ", "HỦY", "KHÁC"], key="out_reason")
+            auto_cups = 0.0
+            if pcode:
+                auto_cups = _cups_per_kg_for_pcode(conn, pcode) * qty
+            cups_override = st.checkbox("Nhập số cốc thủ công (nếu cần)", key="out_cup_manual")
+            cups = st.number_input("Số cốc (-)", value=float(auto_cups), step=1.0, min_value=0.0,
+                                   key="out_cups", disabled=not cups_override)
+
+            if st.button("💾 Lưu phiếu xuất", type="primary", key="out_btn"):
+                if not pcode or qty <= 0:
+                    st.error("Chọn sản phẩm và số lượng > 0.")
+                elif not _prevent_negative(conn, store, pcode, qty):
+                    st.error("Xuất âm kho! Kiểm tra lại số lượng tồn.")
+                else:
+                    run_sql(conn, """
+                        INSERT INTO inventory_ledger(ts, store, pcode, kind, qty, reason, cups)
+                        VALUES (NOW(), :s, :p, 'OUT', :q, :rs, :cups)
+                    """, {"s": store, "p": pcode, "q": qty, "rs": reason, "cups": (float(cups) if cups_override else auto_cups)})
+                    write_audit(conn, "WH_OUT", f"{store} {pcode} -{qty} {uom} cups-{cups}")
+                    st.success("Đã lưu phiếu xuất.")
+
+    # ---------- Tồn kho ----------
+    with tabs[2]:
+        st.subheader("📦 Báo cáo tồn kho")
+        with st.expander("🔎 Bộ lọc (chỉ áp khi bấm **Áp dụng**)", expanded=False):
+            colf1, colf2, colf3, colf4 = st.columns([1, 1, 1, 1])
+            to_date   = colf1.date_input("Chốt đến ngày", value=date.today(), key="stk_to")
+            cat       = colf2.selectbox("Nhóm", ["(Tất cả)", "TRAI_CAY", "COT", "MUT", "PHU_GIA"], key="stk_cat")
+            store     = colf3.selectbox("Cửa hàng", fetch_df(conn, "SELECT code FROM stores ORDER BY code")["code"].tolist(),
+                                        key="stk_store")
+            do_apply  = colf4.button("Áp dụng", key="stk_apply")
+        if 'stk_cache' not in st.session_state or do_apply:
+            cat_val = None if cat == "(Tất cả)" else cat
+            st.session_state['stk_cache'] = _snapshot_stock(conn, store, to_date, cat_val)
+        df_stk = st.session_state.get('stk_cache', pd.DataFrame())
+        if df_stk.empty:
+            st.info("Chưa có số liệu.")
+        else:
+            df_stk["Giá trị tồn (ước)"] = df_stk["total_in_value"]  # tổng giá vốn đã nhập tới thời điểm đó
+            df_stk = df_stk.rename(columns={
+                "code":"Mã", "name":"Tên", "cat_code":"Nhóm", "uom":"ĐVT",
+                "qty":"Tồn SL", "cups":"Tồn cốc"
+            })
+            st.dataframe(df_stk, use_container_width=True, hide_index=True)
+            st.caption(f"Tổng số dòng: {len(df_stk)} | Tổng giá trị (nhập): {df_stk['Giá trị tồn (ước)'].sum():,.0f} VND")
+
+    # ---------- Kiểm kê nâng cao ----------
+    with tabs[3]:
+        st.subheader("🧮 Kiểm kê nâng cao")
+        if not has_perm(user, "WH_AUDIT"):
+            st.warning("Bạn không có quyền kiểm kê (WH_AUDIT).")
+        else:
+            store = st.session_state.get("store") or st.selectbox(
+                "Cửa hàng", fetch_df(conn, "SELECT code FROM stores ORDER BY code")["code"].tolist(),
+                key="kk_store"
+            )
+            pcode, uom = _product_selector(conn, placeholder="— chọn sản phẩm kiểm kê —", key_prefix="kk_")
+            if pcode:
+                st.caption("Số liệu hệ thống đến hiện tại:")
+                qty_sys, cups_sys, _ = _stock_of(conn, store, pcode)
+                st.info(f"Tồn hệ thống: {qty_sys:.3f} {uom} | Cốc: {cups_sys:.0f}")
+
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                qty_real = st.number_input("Số lượng thực tế", value=0.0, step=0.1, min_value=0.0, key="kk_qty")
+            with col2:
+                cups_real = st.number_input("Cốc thực tế (nếu có)", value=0.0, step=1.0, min_value=0.0, key="kk_cups")
+            note = st.text_input("Ghi chú", key="kk_note")
+
+            if st.button("📌 Ghi chênh lệch", type="primary", key="kk_btn"):
+                if not pcode:
+                    st.error("Chọn sản phẩm.")
+                else:
+                    qty_sys, cups_sys, _ = _stock_of(conn, store, pcode)
+                    diff_q = qty_real - qty_sys
+                    diff_c = cups_real - cups_sys
+                    if abs(diff_q) < 1e-9 and abs(diff_c) < 1e-9:
+                        st.info("Không có chênh lệch.")
+                    else:
+                        kind = 'IN' if diff_q >= 0 else 'OUT'
+                        qty = abs(diff_q)
+                        cups = abs(diff_c)
+                        run_sql(conn, """
+                            INSERT INTO inventory_ledger(ts, store, pcode, kind, qty, reason, cups)
+                            VALUES (NOW(), :s, :p, :k, :q, :rs, :cups)
+                        """, {"s": store, "p": pcode, "k": kind, "q": qty,
+                              "rs": f"KIEM_KE: {note}", "cups": (cups if diff_c != 0 else 0)})
+                        write_audit(conn, "WH_AUDIT",
+                                    f"{store} {pcode} diff_qty={diff_q:.3f} diff_cups={diff_c:.0f}")
+                        st.success("Đã ghi kiểm kê.")
+
+# =============== SẢN XUẤT ===============
+def _parse_formula_row(row) -> dict:
+    src = "TRAI_CAY"
+    if (row.get("note") or "").startswith("SRC="):
+        src = (row.get("note") or "").split("=",1)[1]
+    adds = {}
+    try:
+        adds = json.loads(row.get("additives_json") or "{}")
+    except Exception:
+        adds = {}
+    return {
+        "code": row["code"], "name": row["name"], "type": row["type"],
+        "out_pcode": row["output_pcode"], "out_uom": row["output_uom"] or "kg",
+        "recovery": float(row["recovery"] or 1.0),
+        "cups_per_kg": float(row["cups_per_kg"] or 0.0),
+        "fruits": [x for x in (row["fruits_csv"] or "").split(",") if x],
+        "additives": adds,
+        "src": src
+    }
+
+def _formula_options(conn, typ: str):
+    df = fetch_df(conn, "SELECT * FROM formulas WHERE type=:t ORDER BY code", {"t": typ})
+    return df
+
+def _preview_inputs_for_output(conn, formula: dict, qty_out: float):
+    """Tính nguyên liệu cần cho qty_out TP. Trả về df_inputs, cups_out."""
+    cups = formula["cups_per_kg"] * qty_out
+    inputs = []
+    # Nguyên liệu chính: nếu có nhiều, cho tỉ lệ đều — phần UI sẽ cho sửa tỉ lệ trước khi ghi
+    need_raw = qty_out if formula["type"] == "MUT" else (qty_out / (formula["recovery"] or 1.0))
+    if len(formula["fruits"]) > 0:
+        per = 1.0 / len(formula["fruits"])
+        for pc in formula["fruits"]:
+            inputs.append({"pcode": pc, "qty": need_raw * per, "kind":"RAW"})
+    # Phụ gia (kg / 1kg sau sơ chế)
+    for pc, perkg in (formula["additives"] or {}).items():
+        if perkg and float(perkg) > 0:
+            inputs.append({"pcode": pc, "qty": float(perkg) * qty_out, "kind":"ADD"})
+    df = pd.DataFrame(inputs) if inputs else pd.DataFrame(columns=["pcode","qty","kind"])
+    return df, cups
+
+def page_sanxuat(conn: Connection, user: dict):
+    st.markdown("### 🏭 Sản xuất")
+    tabs = st.tabs(["🧪 CỐT (1 bước)", "🍯 MỨT từ TRÁI CÂY", "🍯 MỨT từ CỐT", "🧾 Lịch sử lô"])
+
+    # ---------- CỐT ----------
+    with tabs[0]:
+        st.subheader("🧪 CỐT (1 bước)")
+        if not has_perm(user, "PROD_RUN"):
+            st.warning("Bạn không có quyền sản xuất (PROD_RUN).")
+        else:
+            df_ct = _formula_options(conn, "COT")
+            if df_ct.empty:
+                st.info("Chưa có công thức CỐT.")
+            else:
+                opts = [f"{r.output_pcode} — {r.name} ({r.code})" for _, r in df_ct.iterrows()]
+                lb = st.selectbox("Chọn công thức", opts, key="cot_formula")
+                sel = df_ct.iloc[opts.index(lb)]
+                f = _parse_formula_row(sel)
+                qty_out = st.number_input("Sản lượng TP (kg)", value=0.0, step=0.1, min_value=0.0, key="cot_qty")
+                df_in, cups = _preview_inputs_for_output(conn, f, qty_out)
+
+                # Phân bổ tỉ lệ nguyên liệu chính (nếu nhiều)
+                if not df_in[df_in["kind"]=="RAW"].empty:
+                    st.caption("Tỉ lệ nguyên liệu chính (tổng = 100%)")
+                    raws = df_in[df_in["kind"]=="RAW"].copy()
+                    ratios = []
+                    for i, row in raws.iterrows():
+                        r = st.slider(f"{row['pcode']}", min_value=0, max_value=100,
+                                      value=int(100/len(raws)), key=f"cot_ratio_{row['pcode']}")
+                        ratios.append(r)
+                    s = sum(ratios) or 1
+                    raws["qty"] = (qty_out/(f["recovery"] or 1.0)) * (pd.Series(ratios)/s)
+                    df_in.update(raws)
+
+                st.markdown("**Nguyên liệu dự kiến xuất kho**")
+                st.dataframe(df_in, use_container_width=True, hide_index=True)
+                st.info(f"Dự kiến cốc tạo ra: {cups:.0f}")
+
+                store = st.session_state.get("store") or st.selectbox(
+                    "Cửa hàng", fetch_df(conn, "SELECT code FROM stores ORDER BY code")["code"].tolist(),
+                    key="cot_store"
+                )
+                note = st.text_input("Ghi chú", key="cot_note")
+
+                if st.button("🚀 Thực hiện SX CỐT", type="primary", key="cot_do"):
+                    # kiểm tồn tất cả NVL
+                    ok = True
+                    for _, r in df_in.iterrows():
+                        if not _prevent_negative(conn, store, r["pcode"], float(r["qty"])):
+                            ok = False
+                            st.error(f"Xuất âm kho: {r['pcode']}")
+                    if qty_out <= 0:
+                        ok = False
+                        st.error("Sản lượng phải > 0.")
+                    if ok:
+                        lot = _new_batch_id(conn, store, "COT")
+                        # xuất NVL
+                        for _, r in df_in.iterrows():
+                            run_sql(conn, """
+                                INSERT INTO inventory_ledger(ts, store, pcode, kind, qty, reason, lot_id)
+                                VALUES (NOW(), :s, :p, 'OUT', :q, 'SX_COT', :lot)
+                            """, {"s": store, "p": r["pcode"], "q": float(r["qty"]), "lot": lot})
+                        # nhập TP
+                        run_sql(conn, """
+                            INSERT INTO inventory_ledger(ts, store, pcode, kind, qty, reason, cups, lot_id)
+                            VALUES (NOW(), :s, :p, 'IN', :q, 'SX_COT_DONE', :cups, :lot)
+                        """, {"s": store, "p": f["out_pcode"], "q": float(qty_out), "cups": float(cups), "lot": lot})
+                        # ghi batch
+                        run_sql(conn, """
+                            INSERT INTO prod_batches(batch_id, store, type, ts, output_pcode, qty_out, cups_out, status, note)
+                            VALUES(:id,:s,'COT',NOW(),:p,:q,:c,'DONE',:n)
+                        """, {"id": lot, "s": store, "p": f["out_pcode"], "q": float(qty_out), "c": float(cups), "n": note})
+                        write_audit(conn, "PROD_COT", f"{lot} {f['out_pcode']} +{qty_out}kg cups+{cups}")
+                        st.success(f"Đã tạo lô {lot}.")
+
+    # ---------- MỨT từ TRÁI CÂY ----------
+    with tabs[1]:
+        st.subheader("🍯 MỨT từ TRÁI CÂY")
+        df_ct = _formula_options(conn, "MUT")
+        df_ct = df_ct[df_ct["note"].fillna("").str.startswith("SRC=TRAI_CAY")]
+        if df_ct.empty:
+            st.info("Chưa có công thức MỨT nguồn TRÁI_CÂY.")
+        else:
+            lb = st.selectbox("Chọn công thức", [f"{r.output_pcode} — {r.name} ({r.code})" for _,r in df_ct.iterrows()],
+                              key="mut_tc_formula")
+            sel = df_ct.iloc[[i for i,_ in enumerate(df_ct.index)] [ [f"{r.output_pcode} — {r.name} ({r.code})" for _,r in df_ct.iterrows()].index(lb) ]]
+            f = _parse_formula_row(sel)
+            qty_out = st.number_input("Sản lượng TP (kg)", value=0.0, step=0.1, min_value=0.0, key="mut_tc_qty")
+            df_in, cups = _preview_inputs_for_output(conn, f, qty_out)
+
+            # Phân bổ tỉ lệ trái cây (nếu nhiều)
+            if not df_in[df_in["kind"]=="RAW"].empty:
+                st.caption("Tỉ lệ trái cây (tổng = 100%)")
+                raws = df_in[df_in["kind"]=="RAW"].copy()
+                ratios = []
+                for i, row in raws.iterrows():
+                    r = st.slider(f"{row['pcode']}", min_value=0, max_value=100,
+                                  value=int(100/len(raws)), key=f"mut_tc_ratio_{row['pcode']}")
+                    ratios.append(r)
+                s = sum(ratios) or 1
+                raws["qty"] = qty_out * (pd.Series(ratios)/s)  # rec=1.0 cho MUT
+                df_in.update(raws)
+
+            st.markdown("**Nguyên liệu dự kiến**")
+            st.dataframe(df_in, use_container_width=True, hide_index=True)
+            st.info(f"Dự kiến cốc tạo ra: {cups:.0f}")
+
+            store = st.session_state.get("store") or st.selectbox(
+                "Cửa hàng", fetch_df(conn, "SELECT code FROM stores ORDER BY code")["code"].tolist(),
+                key="mut_tc_store"
+            )
+            note = st.text_input("Ghi chú", key="mut_tc_note")
+
+            if st.button("🚀 Thực hiện SX MỨT (từ TRÁI CÂY)", type="primary", key="mut_tc_do"):
+                ok = True
+                for _, r in df_in.iterrows():
+                    if not _prevent_negative(conn, store, r["pcode"], float(r["qty"])):
+                        ok = False
+                        st.error(f"Xuất âm kho: {r['pcode']}")
+                if qty_out <= 0: ok = False; st.error("Sản lượng phải > 0.")
+                if ok:
+                    lot = _new_batch_id(conn, store, "MUT")
+                    for _, r in df_in.iterrows():
+                        run_sql(conn, """
+                            INSERT INTO inventory_ledger(ts, store, pcode, kind, qty, reason, lot_id)
+                            VALUES (NOW(), :s, :p, 'OUT', :q, 'SX_MUT_TC', :lot)
+                        """, {"s": store, "p": r["pcode"], "q": float(r["qty"]), "lot": lot})
+                    run_sql(conn, """
+                        INSERT INTO inventory_ledger(ts, store, pcode, kind, qty, reason, cups, lot_id)
+                        VALUES (NOW(), :s, :p, 'IN', :q, 'SX_MUT_TC_DONE', :cups, :lot)
+                    """, {"s": store, "p": f["out_pcode"], "q": float(qty_out), "cups": float(cups), "lot": lot})
+                    run_sql(conn, """
+                        INSERT INTO prod_batches(batch_id, store, type, ts, output_pcode, qty_out, cups_out, status, note)
+                        VALUES(:id,:s,'MUT_TC',NOW(),:p,:q,:c,'DONE',:n)
+                    """, {"id": lot, "s": store, "p": f["out_pcode"], "q": float(qty_out), "c": float(cups), "n": note})
+                    write_audit(conn, "PROD_MUT_TC", f"{lot} {f['out_pcode']} +{qty_out}kg cups+{cups}")
+                    st.success(f"Đã tạo lô {lot}.")
+
+    # ---------- MỨT từ CỐT ----------
+    with tabs[2]:
+        st.subheader("🍯 MỨT từ CỐT")
+        df_ct = _formula_options(conn, "MUT")
+        df_ct = df_ct[df_ct["note"].fillna("").str.startswith("SRC=COT")]
+        if df_ct.empty:
+            st.info("Chưa có công thức MỨT nguồn CỐT.")
+        else:
+            lb = st.selectbox("Chọn công thức", [f"{r.output_pcode} — {r.name} ({r.code})" for _,r in df_ct.iterrows()],
+                              key="mut_cot_formula")
+            sel = df_ct.iloc[[i for i,_ in enumerate(df_ct.index)] [ [f"{r.output_pcode} — {r.name} ({r.code})" for _,r in df_ct.iterrows()].index(lb) ]]
+            f = _parse_formula_row(sel)
+            qty_out = st.number_input("Sản lượng TP (kg)", value=0.0, step=0.1, min_value=0.0, key="mut_cot_qty")
+            df_in, cups = _preview_inputs_for_output(conn, f, qty_out)
+            st.markdown("**Nguyên liệu dự kiến**")
+            st.dataframe(df_in, use_container_width=True, hide_index=True)
+            st.info(f"Dự kiến cốc tạo ra: {cups:.0f}")
+
+            store = st.session_state.get("store") or st.selectbox(
+                "Cửa hàng", fetch_df(conn, "SELECT code FROM stores ORDER BY code")["code"].tolist(),
+                key="mut_cot_store"
+            )
+            note = st.text_input("Ghi chú", key="mut_cot_note")
+
+            if st.button("🚀 Thực hiện SX MỨT (từ CỐT)", type="primary", key="mut_cot_do"):
+                ok = True
+                for _, r in df_in.iterrows():
+                    if not _prevent_negative(conn, store, r["pcode"], float(r["qty"])):
+                        ok = False
+                        st.error(f"Xuất âm kho: {r['pcode']}")
+                if qty_out <= 0: ok = False; st.error("Sản lượng phải > 0.")
+                if ok:
+                    lot = _new_batch_id(conn, store, "MUT")
+                    for _, r in df_in.iterrows():
+                        run_sql(conn, """
+                            INSERT INTO inventory_ledger(ts, store, pcode, kind, qty, reason, lot_id)
+                            VALUES (NOW(), :s, :p, 'OUT', :q, 'SX_MUT_COT', :lot)
+                        """, {"s": store, "p": r["pcode"], "q": float(r["qty"]), "lot": lot})
+                    run_sql(conn, """
+                        INSERT INTO inventory_ledger(ts, store, pcode, kind, qty, reason, cups, lot_id)
+                        VALUES (NOW(), :s, :p, 'IN', :q, 'SX_MUT_COT_DONE', :cups, :lot)
+                    """, {"s": store, "p": f["out_pcode"], "q": float(qty_out), "cups": float(cups), "lot": lot})
+                    run_sql(conn, """
+                        INSERT INTO prod_batches(batch_id, store, type, ts, output_pcode, qty_out, cups_out, status, note)
+                        VALUES(:id,:s,'MUT_COT',NOW(),:p,:q,:c,'DONE',:n)
+                    """, {"id": lot, "s": store, "p": f["out_pcode"], "q": float(qty_out), "c": float(cups), "n": note})
+                    write_audit(conn, "PROD_MUT_COT", f"{lot} {f['out_pcode']} +{qty_out}kg cups+{cups}")
+                    st.success(f"Đã tạo lô {lot}.")
+
+    # ---------- Lịch sử lô ----------
+    with tabs[3]:
+        st.subheader("🧾 Lịch sử lô")
+        col1, col2, col3 = st.columns([1,1,2])
+        d_from = col1.date_input("Từ ngày", value=date.today()-timedelta(days=30), key="his_from")
+        d_to   = col2.date_input("Đến ngày", value=date.today(), key="his_to")
+        store  = st.session_state.get("store") or col3.selectbox(
+            "Cửa hàng", fetch_df(conn, "SELECT code FROM stores ORDER BY code")["code"].tolist(),
+            key="his_store"
+        )
+        df = fetch_df(conn, """
+            SELECT batch_id, store, type, ts, output_pcode, qty_out, cups_out, status, note
+            FROM prod_batches
+            WHERE ts::date BETWEEN :f AND :t AND store=:s
+            ORDER BY ts DESC
+        """, {"f": d_from, "t": d_to, "s": store})
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        if has_perm(user, "PROD_DELETE"):
+            st.warning("⚠️ Hoàn tác lô sẽ đảo chiều chứng từ kho liên quan.")
+            lot = st.text_input("Nhập mã lô để hoàn tác", key="his_rm_lot")
+            if st.button("🧨 Hoàn tác lô", key="his_rm_btn"):
+                if not lot:
+                    st.error("Nhập mã lô.")
+                else:
+                    # đảo chiều ledger của lot
+                    df_legs = fetch_df(conn, "SELECT * FROM inventory_ledger WHERE lot_id=:id", {"id": lot})
+                    if df_legs.empty:
+                        st.error("Không tìm thấy chứng từ.")
+                    else:
+                        for _, r in df_legs.iterrows():
+                            kind = "OUT" if r["kind"]=="IN" else "IN"
+                            run_sql(conn, """
+                                INSERT INTO inventory_ledger(ts, store, pcode, kind, qty, price_in, reason, cups, lot_id)
+                                VALUES (NOW(), :s, :p, :k, :q, :pr, :rs, :cups, :lot)
+                            """, {"s": r["store"], "p": r["pcode"], "k": kind, "q": float(r["qty"]),
+                                  "pr": float(r.get("price_in") or 0), "rs": f"UNDO:{r['reason']}",
+                                  "cups": float(r.get("cups") or 0), "lot": f"UNDO-{lot}"})
+                        run_sql(conn, "UPDATE prod_batches SET status='VOID' WHERE batch_id=:id", {"id": lot})
+                        write_audit(conn, "PROD_UNDO", lot)
+                        st.success("Đã hoàn tác.")
+
+# ---------- Gắn vào router ----------
+def router():
+    _ensure_session_defaults()
+    conn = get_conn()
+    user = require_login(conn)
+    header_top(conn, user)
+    menu = sidebar_menu(conn, user)
+
+    if menu == "Dashboard":
+        page_dashboard(conn, user)
+    elif menu == "Danh mục":
+        page_danhmuc(conn, user)
+    elif menu == "Cửa hàng":
+        page_cuahang(conn, user)
+    elif menu == "Người dùng":
+        page_nguoidung(conn, user)
+    elif menu == "Kho":
+        page_kho(conn, user)
+    elif menu == "Sản xuất":
+        page_sanxuat(conn, user)
+    elif menu == "Báo cáo":
+        st.info("Báo cáo sẽ ở **Phần 4**.")
+    elif menu == "TSCD":
+        st.info("TSCD sẽ ở **Phần 4**.")
+    elif menu == "Doanh thu":
+        st.info("Doanh thu sẽ ở **Phần 5**.")
+    elif menu == "Nhật ký":
+        if has_perm(user, "AUDIT_VIEW"):
+            df = fetch_df(conn, "SELECT ts,actor,action,detail FROM syslog ORDER BY ts DESC LIMIT 300")
+            st.markdown("### 🗒️ Nhật ký hệ thống")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.warning("Bạn không có quyền xem nhật ký.")
