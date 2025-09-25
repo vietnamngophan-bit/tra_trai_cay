@@ -109,7 +109,7 @@ def logout(conn: Connection):
 def header_top(conn: Connection, user: dict):
     c1, c2 = st.columns([0.8,0.2])
     with c1:
-        st.markdown("## 🍵 Fruit Tea ERP v5")
+        st.markdown("## 🍹 Quản Trị Trà Trái Cây Anh Gầy")
         st.caption("Kết nối: Postgres (Supabase)")
     with c2:
         with st.popover(f"👤 {user.get('display','')}"):
