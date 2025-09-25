@@ -993,4 +993,194 @@ elif _menu == "Kho":
     page_kho(conn)
 elif _menu == "Báo cáo":
     page_baocao(conn)
+# ============================================================
+# app.py — PART 5/5 (Doanh thu, TSCD, Nhật ký, Dashboard + Router)
+# ============================================================
+
+# ---------- DOANH THU (chỉ CASH/BANK) ----------
+def page_doanhthu(conn):
+    st.header("💰 Doanh thu (CASH / BANK)")
+    store = st.session_state.get("store","HOSEN")
+
+    tab_rec, tab_hist = st.tabs(["Ghi doanh thu", "Lịch sử"])
+
+    with tab_rec:
+        c1, c2, c3 = st.columns([1.2,1,2])
+        with c1:
+            ngay = st.date_input("Ngày", datetime.today().date(), key="rev_ngay")
+            amount = st.number_input("Số tiền (VND)", 0.0, step=1000.0, min_value=0.0)
+            pay = st.radio("Hình thức", ["CASH","BANK"], horizontal=True)
+        with c2:
+            note = st.text_input("Ghi chú (tuỳ chọn)")
+        with c3:
+            st.markdown("**Chi tiết sản phẩm (tùy chọn)**")
+            # Cho phép ghi kèm SP để tính COGS ở Báo cáo
+            df_all = product_list(conn, keyword=st.text_input("Lọc SP (mã/tên)", key="rev_kw"))
+            codes = [""] + (df_all["code"].tolist() if not df_all.empty else [])
+            def fmt(x):
+                if not x: return ""
+                if df_all.empty or x not in df_all["code"].values: return x
+                row = df_all.set_index("code").loc[x]
+                return f"{x} — {row['name']}"
+            p = st.selectbox("SP (tuỳ chọn)", codes, format_func=fmt)
+            q = st.number_input("Số lượng (tuỳ chọn)", 0.0, step=0.1, min_value=0.0)
+            uprice = st.number_input("Đơn giá bán (VND/kg, tuỳ chọn)", 0.0, step=1000.0, min_value=0.0)
+
+        if st.button("💾 Ghi doanh thu"):
+            if amount <= 0:
+                st.error("⚠️ Nhập số tiền > 0.")
+            else:
+                run_sql(conn, """
+                    INSERT INTO revenue(ts,store,amount,pay_method,pcode,qty,unit_price,note)
+                    VALUES(:d,:s,:a,:pm,:p,:q,:u,:no)
+                """, {"d": ngay.strftime("%Y-%m-%d"), "s": store, "a": amount, "pm": pay,
+                      "p": (p if p else None), "q": (q if q>0 else None),
+                      "u": (uprice if uprice>0 else None), "no": note})
+                log_action(conn, st.session_state["user"]["email"], "REV_ADD", f"{amount} {pay}")
+                st.success("✅ Đã ghi doanh thu.")
+                st.experimental_rerun()
+
+    with tab_hist:
+        c1, c2 = st.columns(2)
+        with c1:
+            fr = st.date_input("Từ ngày", datetime.today().date().replace(day=1), key="rev_fr")
+        with c2:
+            to = st.date_input("Đến ngày", datetime.today().date(), key="rev_to")
+        df = fetch_df(conn, """
+            SELECT ts::date AS ngay, pay_method, amount, pcode, qty, unit_price, note
+            FROM revenue
+            WHERE store=:s AND ts BETWEEN :fr AND :to
+            ORDER BY ts DESC
+        """, {"s": store, "fr": fr.strftime("%Y-%m-%d"), "to": to.strftime("%Y-%m-%d")})
+        st.dataframe(df, use_container_width=True, height=380)
+        if not df.empty:
+            st.download_button("⬇️ Xuất CSV", df.to_csv(index=False).encode("utf-8"),
+                               file_name=f"doanhthu_{fr}_{to}.csv", mime="text/csv")
+
+# ---------- TÀI SẢN CỐ ĐỊNH ----------
+def page_tscd(conn):
+    st.header("🏗️ Tài sản cố định (TSCD)")
+    user = st.session_state.get("user") or {}
+    if not has_perm(user, "TSCD"):
+        st.warning("⛔ Bạn không có quyền TSCD."); return
+
+    df = fetch_df(conn, "SELECT id,name,cost,dep_per_month,buy_date FROM tscd ORDER BY buy_date DESC")
+    st.dataframe(df, use_container_width=True, height=300)
+
+    st.markdown("#### ➕ Thêm / ✏️ Sửa TSCD")
+    with st.form("tscd_form"):
+        c1, c2, c3, c4 = st.columns([2,1,1,1])
+        with c1:
+            name = st.text_input("Tên tài sản*")
+        with c2:
+            cost = st.number_input("Nguyên giá (VND)", 0.0, step=1000.0)
+        with c3:
+            dep  = st.number_input("Khấu hao/tháng (VND)", 0.0, step=1000.0)
+        with c4:
+            bdate= st.date_input("Ngày mua", datetime.today().date())
+        ok = st.form_submit_button("💾 Lưu")
+    if ok:
+        if not name or cost<=0:
+            st.error("Tên & nguyên giá bắt buộc.")
+        else:
+            run_sql(conn, """
+                INSERT INTO tscd(name,cost,dep_per_month,buy_date)
+                VALUES(:n,:c,:d,:b)
+            """, {"n": name.strip(), "c": cost, "d": dep, "b": bdate.strftime("%Y-%m-%d")})
+            log_action(conn, user["email"], "TSCD_ADD", name.strip())
+            st.success("✅ Đã thêm TSCD.")
+            st.experimental_rerun()
+
+    with st.expander("🗑️ Xóa TSCD", expanded=False):
+        del_id = st.text_input("Nhập ID TSCD cần xóa")
+        if st.button("Xác nhận xóa TSCD"):
+            if not del_id:
+                st.warning("Nhập ID trước khi xóa.")
+            else:
+                run_sql(conn, "DELETE FROM tscd WHERE id=:i", {"i": del_id})
+                log_action(conn, user["email"], "TSCD_DELETE", str(del_id))
+                st.success("Đã xóa.")
+                st.experimental_rerun()
+
+# ---------- NHẬT KÝ HỆ THỐNG ----------
+def page_syslog(conn):
+    st.header("📜 Nhật ký hệ thống")
+    user = st.session_state.get("user") or {}
+    # Chỉ SuperAdmin/admin hoặc có quyền USERS mới xem được log
+    if not has_perm(user, "USERS"):
+        if (user.get("role","").lower() not in ("superadmin","admin")):
+            st.warning("⛔ Bạn không có quyền xem nhật ký."); return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fr = st.date_input("Từ ngày", datetime.today().date()-timedelta(days=7), key="log_fr")
+    with c2:
+        to = st.date_input("Đến ngày", datetime.today().date(), key="log_to")
+    df = fetch_df(conn, """
+        SELECT ts::timestamp(0) AS ts, user_email, action, detail
+        FROM syslog
+        WHERE ts BETWEEN :fr AND :to
+        ORDER BY ts DESC
+        LIMIT 1000
+    """, {"fr": fr.strftime("%Y-%m-%d"), "to": to.strftime("%Y-%m-%d")})
+    st.dataframe(df, use_container_width=True, height=420)
+    if not df.empty:
+        st.download_button("⬇️ Xuất CSV", df.to_csv(index=False).encode("utf-8"),
+                           file_name=f"syslog_{fr}_{to}.csv", mime="text/csv")
+
+# ---------- DASHBOARD ----------
+def page_dashboard(conn):
+    st.header("📊 Dashboard tổng quan")
+    store = st.session_state.get("store","HOSEN")
+
+    # Doanh thu 14 ngày
+    rev14 = fetch_df(conn, """
+        SELECT ts::date AS d, SUM(amount) AS amount
+        FROM revenue
+        WHERE store=:s AND ts >= NOW() - interval '14 day'
+        GROUP BY d ORDER BY d
+    """, {"s": store})
+    st.subheader("Doanh thu 14 ngày gần nhất")
+    if not rev14.empty:
+        st.line_chart(rev14.set_index("d"))
+    else:
+        st.info("Chưa có dữ liệu doanh thu.")
+
+    # Tồn kho hiện tại
+    st.subheader("Top tồn kho theo trị giá")
+    ton = stock_snapshot(conn, store, datetime.today().date())
+    if not ton.empty:
+        st.dataframe(ton.sort_values("value", ascending=False).head(10), use_container_width=True)
+        st.metric("Tổng giá trị tồn", f"{ton['value'].sum():,.0f} VND")
+        st.metric("Tổng số cốc (COT/MUT)", f"{ton['ton_cups'].sum():,.0f}")
+    else:
+        st.info("Chưa có dữ liệu tồn kho.")
+
+    # TSCD tổng quan
+    df_t = fetch_df(conn, "SELECT COUNT(*) AS n, COALESCE(SUM(cost),0) AS total FROM tscd")
+    if not df_t.empty:
+        n = int(df_t.iloc[0]["n"]); val = float(df_t.iloc[0]["total"])
+        st.metric("TSCD đã ghi nhận", n, help=f"Tổng nguyên giá: {val:,.0f} VND")
+
+# ---------- ROUTER TỔNG CUỐI FILE ----------
+if _menu == "Dashboard":
+    page_dashboard(conn)
+elif _menu == "Danh mục":
+    page_danhmuc(conn)
+elif _menu == "Kho":
+    page_kho(conn)
+elif _menu == "Sản xuất":
+    page_sanxuat(conn)
+elif _menu == "Doanh thu":
+    page_doanhthu(conn)
+elif _menu == "Báo cáo":
+    page_baocao(conn)
+elif _menu == "TSCD":
+    page_tscd(conn)
+elif _menu == "Nhật ký":
+    page_syslog(conn)
+elif _menu == "Đăng xuất":
+    log_action(conn, st.session_state["user"]["email"], "LOGOUT", "")
+    st.session_state.clear()
+    st.experimental_rerun()
 
