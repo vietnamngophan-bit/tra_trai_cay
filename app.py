@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection
 
 # ---------- PAGE CONFIG ----------
-st.set_page_config(page_title="Fruit Tea ERP v5", page_icon="🍵",
+st.set_page_config(page_title="Hệ Thống Quản Lý Sản Xuất", page_icon="🍹",
                    layout="wide", initial_sidebar_state="expanded")
 
 # ---------- POSTGRES ----------
