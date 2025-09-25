@@ -331,3 +331,341 @@ def router():
 # ------------------- ENTRY -------------------
 if __name__ == "__main__":
     router()
+# ============================================================
+# PHẦN 2/5 — Dashboard + Danh mục + Cửa hàng + Người dùng
+# (CRUD đầy đủ, dùng các helper/perm/audit từ Phần 1)
+# ============================================================
+
+# ---------- DASHBOARD (nhẹ, tổng quan) ----------
+def page_dashboard(conn: Connection, user: dict):
+    st.markdown("### 📊 Tổng quan nhanh")
+    c1, c2, c3, c4 = st.columns(4)
+    # Tổng số SKU
+    n_sku = fetch_df(conn, "SELECT COUNT(*) n FROM products").iloc[0]["n"]
+    n_ct  = fetch_df(conn, "SELECT COUNT(*) n FROM formulas").iloc[0]["n"]
+    n_st  = fetch_df(conn, "SELECT COUNT(*) n FROM stores").iloc[0]["n"]
+    n_user= fetch_df(conn, "SELECT COUNT(*) n FROM users").iloc[0]["n"]
+    c1.metric("Sản phẩm (SKU)", n_sku)
+    c2.metric("Công thức", n_ct)
+    c3.metric("Cửa hàng", n_st)
+    c4.metric("Người dùng", n_user)
+
+    st.divider()
+    st.caption("Hoạt động gần đây")
+    df = fetch_df(conn, "SELECT ts, actor, action, detail FROM syslog ORDER BY ts DESC LIMIT 20")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+# ---------- DANH MỤC: Categories + Products + Formulas ----------
+def page_danhmuc(conn: Connection, user: dict):
+    st.markdown("### 📚 Danh mục")
+    tabs = st.tabs(["📁 Nhóm hàng", "📦 Sản phẩm (SKU)", "🧪 Công thức (CỐT/MỨT)"])
+
+    # --- 1) Nhóm hàng (categories) ---
+    with tabs[0]:
+        st.subheader("📁 Nhóm hàng")
+        df = fetch_df(conn, "SELECT code,name FROM categories ORDER BY code")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        if has_perm(user, "CAT_EDIT"):
+            with st.form("cat_add", clear_on_submit=True):
+                st.markdown("**Thêm / Sửa nhóm**")
+                code = st.text_input("Mã nhóm", key="cat_code")
+                name = st.text_input("Tên nhóm", key="cat_name")
+                colA, colB, colC = st.columns(3)
+                ok_add  = colA.form_submit_button("💾 Lưu (thêm/sửa)", use_container_width=True)
+                ok_del  = colB.form_submit_button("🗑️ Xoá", use_container_width=True)
+                cancel  = colC.form_submit_button("HUỶ", use_container_width=True)
+
+            if ok_add and code and name:
+                run_sql(conn, "INSERT INTO categories(code,name) VALUES(:c,:n) "
+                              "ON CONFLICT (code) DO UPDATE SET name=EXCLUDED.name",
+                              {"c":code.strip(), "n":name.strip()})
+                write_audit(conn, "CAT_UPSERT", f"{code}={name}")
+                st.success("Đã lưu nhóm hàng.")
+                st.rerun()
+            if ok_del and code:
+                run_sql(conn, "DELETE FROM categories WHERE code=:c", {"c": code.strip()})
+                write_audit(conn, "CAT_DELETE", code)
+                st.success("Đã xoá.")
+                st.rerun()
+        else:
+            st.info("Bạn không có quyền chỉnh sửa nhóm (CAT_EDIT).")
+
+    # --- 2) Sản phẩm (products) ---
+    with tabs[1]:
+        st.subheader("📦 Sản phẩm")
+        dfp = fetch_df(conn, """
+            SELECT p.code, p.name, p.cat_code, p.uom, COALESCE(p.is_active,true) is_active
+            FROM products p ORDER BY p.code
+        """)
+        st.dataframe(dfp, use_container_width=True, hide_index=True)
+
+        if has_perm(user, "SKU_EDIT"):
+            st.markdown("**Thêm / Sửa / Xoá sản phẩm**")
+            cats = fetch_df(conn, "SELECT code,name FROM categories ORDER BY code")
+            cat_opts = [f"{r['code']} — {r['name']}" for _,r in cats.iterrows()] if not cats.empty else []
+
+            with st.form("sku_edit", clear_on_submit=True):
+                col1, col2, col3 = st.columns([2,2,1])
+                code = col1.text_input("Mã SP", key="sku_code")
+                name = col2.text_input("Tên SP", key="sku_name")
+                uom  = col3.text_input("ĐVT", value="kg", key="sku_uom")
+                cat_label = st.selectbox("Nhóm", cat_opts, index=0 if cat_opts else None, key="sku_cat")
+                active = st.checkbox("Đang dùng", value=True, key="sku_active")
+                cA, cB, cC = st.columns(3)
+                ok = cA.form_submit_button("💾 Lưu", use_container_width=True)
+                rm = cB.form_submit_button("🗑️ Xoá", use_container_width=True)
+                _  = cC.form_submit_button("HUỶ", use_container_width=True)
+
+            if ok and code and name and cat_opts:
+                cat_code = cat_label.split(" — ",1)[0]
+                run_sql(conn, """
+                    INSERT INTO products(code,name,cat_code,uom,is_active)
+                    VALUES(:c,:n,:cat,:u,:a)
+                    ON CONFLICT (code)
+                    DO UPDATE SET name=EXCLUDED.name, cat_code=EXCLUDED.cat_code,
+                                  uom=EXCLUDED.uom, is_active=EXCLUDED.is_active
+                """, {"c":code.strip(),"n":name.strip(),"cat":cat_code,"u":uom.strip(),"a":bool(active)})
+                write_audit(conn,"SKU_UPSERT",code)
+                st.success("Đã lưu sản phẩm.")
+                st.rerun()
+            if rm and code:
+                run_sql(conn,"DELETE FROM products WHERE code=:c",{"c":code.strip()})
+                write_audit(conn,"SKU_DELETE",code)
+                st.success("Đã xoá.")
+                st.rerun()
+        else:
+            st.info("Bạn không có quyền chỉnh sửa sản phẩm (SKU_EDIT).")
+
+    # --- 3) Công thức (formulas) ---
+    with tabs[2]:
+        st.subheader("🧪 Công thức (CỐT / MỨT)")
+        dff = fetch_df(conn, """
+            SELECT code,name,type,output_pcode,output_uom,recovery,cups_per_kg,
+                   fruits_csv, additives_json, note
+            FROM formulas ORDER BY code
+        """)
+        st.dataframe(dff, use_container_width=True, hide_index=True)
+
+        if has_perm(user, "CT_EDIT"):
+            st.markdown("**Thêm / Sửa / Xoá công thức**")
+            # danh sách đầu ra theo loại
+            prod_all = fetch_df(conn, "SELECT code,name,cat_code FROM products ORDER BY code")
+            cot_list = prod_all[prod_all["cat_code"]=="COT"] if not prod_all.empty else pd.DataFrame()
+            mut_list = prod_all[prod_all["cat_code"]=="MUT"] if not prod_all.empty else pd.DataFrame()
+            trai_list= prod_all[prod_all["cat_code"]=="TRAI_CAY"] if not prod_all.empty else pd.DataFrame()
+            pg_list  = prod_all[prod_all["cat_code"]=="PHU_GIA"] if not prod_all.empty else pd.DataFrame()
+
+            with st.form("ct_edit", clear_on_submit=True):
+                col1, col2, col3 = st.columns(3)
+                code = col1.text_input("Mã CT", key="ct_code")
+                name = col2.text_input("Tên CT", key="ct_name")
+                typ  = col3.selectbox("Loại", ["COT","MUT"], key="ct_type")
+
+                # Output product theo loại
+                if typ == "COT":
+                    opts = [f"{r.code} — {r.name}" for _,r in cot_list.iterrows()]
+                else:
+                    opts = [f"{r.code} — {r.name}" for _,r in mut_list.iterrows()]
+                out_label = st.selectbox("SP đầu ra", opts, index=0 if opts else None, key="ct_out")
+
+                uom = st.text_input("ĐVT TP", value="kg", key="ct_uom")
+
+                if typ == "COT":
+                    rec = st.number_input("Hệ số thu hồi (CỐT)", value=1.0, step=0.1, key="ct_rec")
+                else:
+                    rec = 1.0  # mứt không dùng hệ số
+
+                cups = st.number_input("Cốc / 1kg TP", value=0.0, step=1.0, key="ct_cups")
+
+                # Nguồn NVL cho MỨT
+                src = st.radio("Nguồn NVL cho MỨT", ["TRAI_CAY","COT"], index=0, horizontal=True, key="ct_src")
+
+                # Nguyên liệu chính
+                if typ=="COT" or src=="TRAI_CAY":
+                    raw_pool = trai_list
+                else:
+                    raw_pool = cot_list
+                raw_opts = [f"{r.code} — {r.name}" for _,r in raw_pool.iterrows()]
+                raw_sel = st.multiselect("Nguyên liệu (mã)", raw_opts, key="ct_raw")
+
+                # Phụ gia + định lượng
+                pg_opts = [f"{r.code} — {r.name}" for _,r in pg_list.iterrows()]
+                pg_sel = st.multiselect("Phụ gia", pg_opts, key="ct_pg")
+                add_q = {}
+                for label in pg_sel:
+                    c = label.split(" — ",1)[0]
+                    add_q[c] = st.number_input(f"{c} (kg / 1kg sau sơ chế)", value=0.0, step=0.1, key=f"ct_pg_{c}")
+
+                colA, colB, colC = st.columns(3)
+                ok = colA.form_submit_button("💾 Lưu", use_container_width=True)
+                rm = colB.form_submit_button("🗑️ Xoá", use_container_width=True)
+                _  = colC.form_submit_button("HUỶ", use_container_width=True)
+
+            if ok and code and out_label:
+                out_code = out_label.split(" — ",1)[0]
+                fruits_csv = ",".join([x.split(" — ",1)[0] for x in raw_sel])
+                note = f"SRC={src}" if typ=="MUT" else ""
+                run_sql(conn, """
+                    INSERT INTO formulas(code,name,type,output_pcode,output_uom,recovery,
+                                         cups_per_kg,fruits_csv,additives_json,note)
+                    VALUES(:c,:n,:t,:op,:u,:r,:cups,:fr,:adds,:note)
+                    ON CONFLICT (code) DO UPDATE SET
+                      name=EXCLUDED.name, type=EXCLUDED.type, output_pcode=EXCLUDED.output_pcode,
+                      output_uom=EXCLUDED.output_uom, recovery=EXCLUDED.recovery,
+                      cups_per_kg=EXCLUDED.cups_per_kg, fruits_csv=EXCLUDED.fruits_csv,
+                      additives_json=EXCLUDED.additives_json, note=EXCLUDED.note
+                """, {
+                    "c":code.strip(),"n":name.strip(),"t":typ,"op":out_code,"u":uom.strip(),
+                    "r":float(rec),"cups":float(cups),"fr":fruits_csv,
+                    "adds":json.dumps(add_q, ensure_ascii=False),"note":note
+                })
+                write_audit(conn,"CT_UPSERT",code)
+                st.success("Đã lưu công thức.")
+                st.rerun()
+
+            if rm and code:
+                run_sql(conn,"DELETE FROM formulas WHERE code=:c",{"c":code.strip()})
+                write_audit(conn,"CT_DELETE",code)
+                st.success("Đã xoá công thức.")
+                st.rerun()
+        else:
+            st.info("Bạn không có quyền chỉnh sửa công thức (CT_EDIT).")
+
+# ---------- CỬA HÀNG (stores) ----------
+def page_cuahang(conn: Connection, user: dict):
+    st.markdown("### 🏬 Cửa hàng")
+    df = fetch_df(conn, "SELECT code,name,address,phone,COALESCE(is_active,true) is_active FROM stores ORDER BY code")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    if has_perm(user,"STORE_EDIT"):
+        st.markdown("**Thêm / Sửa / Xoá cửa hàng**")
+        with st.form("store_edit", clear_on_submit=True):
+            col1, col2 = st.columns([1,2])
+            code = col1.text_input("Mã cửa hàng", key="st_code")
+            name = col2.text_input("Tên cửa hàng", key="st_name")
+            address = st.text_input("Địa chỉ", key="st_addr")
+            phone   = st.text_input("Điện thoại", key="st_phone")
+            active  = st.checkbox("Đang hoạt động", value=True, key="st_active")
+            cA, cB, cC = st.columns(3)
+            ok = cA.form_submit_button("💾 Lưu", use_container_width=True)
+            rm = cB.form_submit_button("🗑️ Xoá", use_container_width=True)
+            _  = cC.form_submit_button("HUỶ", use_container_width=True)
+
+        if ok and code and name:
+            run_sql(conn, """
+                INSERT INTO stores(code,name,address,phone,is_active)
+                VALUES(:c,:n,:a,:p,:act)
+                ON CONFLICT (code) DO UPDATE SET
+                    name=EXCLUDED.name, address=EXCLUDED.address,
+                    phone=EXCLUDED.phone, is_active=EXCLUDED.is_active
+            """, {"c":code.strip(),"n":name.strip(),"a":address,"p":phone,"act":bool(active)})
+            write_audit(conn,"STORE_UPSERT",code)
+            st.success("Đã lưu cửa hàng.")
+            st.rerun()
+        if rm and code:
+            run_sql(conn,"DELETE FROM stores WHERE code=:c",{"c":code.strip()})
+            write_audit(conn,"STORE_DELETE",code)
+            st.success("Đã xoá.")
+            st.rerun()
+    else:
+        st.info("Bạn không có quyền chỉnh sửa cửa hàng (STORE_EDIT).")
+
+# ---------- NGƯỜI DÙNG (users) ----------
+def page_nguoidung(conn: Connection, user: dict):
+    st.markdown("### 👥 Người dùng")
+    df = fetch_df(conn, """
+        SELECT email, display, role, store_code, perms
+        FROM users ORDER BY email
+    """)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    if has_perm(user, "USER_EDIT"):
+        st.markdown("**Thêm / Sửa / Xoá người dùng**")
+        stores = fetch_df(conn, "SELECT code,name FROM stores ORDER BY name")
+        store_opts = ["(Không gán)"] + [f"{r.code} — {r.name}" for _,r in stores.iterrows()]
+
+        with st.form("user_edit", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            email   = col1.text_input("Email (đăng nhập)", key="us_email")
+            display = col2.text_input("Tên hiển thị", key="us_disp")
+            role    = st.selectbox("Vai trò", ["User","Admin","SuperAdmin"], key="us_role")
+            store_lb= st.selectbox("Cửa hàng mặc định", store_opts, key="us_store")
+            perms   = st.text_area("Quyền (phân tách dấu phẩy)", value=",".join(PERM_ALL if role=="Admin" else []), key="us_perms")
+            pw_new  = st.text_input("Mật khẩu (để trống nếu không đổi)", type="password", key="us_pw")
+            cA,cB,cC = st.columns(3)
+            ok = cA.form_submit_button("💾 Lưu", use_container_width=True)
+            rm = cB.form_submit_button("🗑️ Xoá", use_container_width=True)
+            _  = cC.form_submit_button("HUỶ", use_container_width=True)
+
+        if ok and email:
+            store_code = None if store_lb=="(Không gán)" else store_lb.split(" — ",1)[0]
+            if pw_new:
+                run_sql(conn, """
+                    INSERT INTO users(email,display,password,role,store_code,perms)
+                    VALUES(:e,:d,:p,:r,:s,:pm)
+                    ON CONFLICT (email) DO UPDATE SET
+                        display=EXCLUDED.display, password=EXCLUDED.password,
+                        role=EXCLUDED.role, store_code=EXCLUDED.store_code,
+                        perms=EXCLUDED.perms
+                """, {"e":email.strip(),"d":display or email.strip(),"p":sha256(pw_new),
+                      "r":role,"s":store_code,"pm":perms.strip()})
+            else:
+                run_sql(conn, """
+                    INSERT INTO users(email,display,password,role,store_code,perms)
+                    VALUES(:e,:d,COALESCE((SELECT password FROM users WHERE email=:e), :p_keep),:r,:s,:pm)
+                    ON CONFLICT (email) DO UPDATE SET
+                        display=EXCLUDED.display,
+                        role=EXCLUDED.role, store_code=EXCLUDED.store_code,
+                        perms=EXCLUDED.perms
+                """, {"e":email.strip(),"d":display or email.strip(),"p_keep":sha256("changeme"),
+                      "r":role,"s":store_code,"pm":perms.strip()})
+            write_audit(conn,"USER_UPSERT",email)
+            st.success("Đã lưu người dùng.")
+            st.rerun()
+
+        if rm and email:
+            if email.strip().lower()==st.session_state.get("user",{}).get("email","").lower():
+                st.error("Không thể xoá tài khoản đang đăng nhập.")
+            else:
+                run_sql(conn,"DELETE FROM users WHERE email=:e",{"e":email.strip()})
+                write_audit(conn,"USER_DELETE",email)
+                st.success("Đã xoá.")
+                st.rerun()
+    else:
+        st.info("Bạn không có quyền chỉnh sửa người dùng (USER_EDIT).")
+
+# ---------- ROUTER CẬP NHẬT (thay cho placeholder ở Phần 1) ----------
+def router():
+    """Router duy nhất: gọi trang theo menu."""
+    _ensure_session_defaults()
+    conn = get_conn()
+    user = require_login(conn)
+    header_top(conn, user)
+    menu = sidebar_menu(conn, user)
+
+    if menu == "Dashboard":
+        page_dashboard(conn, user)
+    elif menu == "Danh mục":
+        page_danhmuc(conn, user)
+    elif menu == "Cửa hàng":
+        page_cuahang(conn, user)
+    elif menu == "Người dùng":
+        page_nguoidung(conn, user)
+    elif menu == "Nhật ký":
+        if has_perm(user, "AUDIT_VIEW"):
+            df = fetch_df(conn, "SELECT ts,actor,action,detail FROM syslog ORDER BY ts DESC LIMIT 300")
+            st.markdown("### 🗒️ Nhật ký hệ thống")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.warning("Bạn không có quyền xem nhật ký.")
+    elif menu == "Kho":
+        st.info("Kho sẽ được cung cấp đầy đủ ở **Phần 3**.")
+    elif menu == "Sản xuất":
+        st.info("Sản xuất (CỐT/MỨT) sẽ ở **Phần 3**.")
+    elif menu == "Báo cáo":
+        st.info("Báo cáo sẽ ở **Phần 4**.")
+    elif menu == "TSCD":
+        st.info("TSCD sẽ ở **Phần 4**.")
+    elif menu == "Doanh thu":
+        st.info("Doanh thu sẽ ở **Phần 5**.")
