@@ -1215,3 +1215,362 @@ def router():
             st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.warning("Bạn không có quyền xem nhật ký.")
+# ============================================================
+# PHẦN 4/5 — BÁO CÁO TÀI CHÍNH + TÀI SẢN CỐ ĐỊNH
+# ============================================================
+
+# ---------- Helpers tài chính ----------
+def _stock_value(conn, store: str, to_dt: date):
+    """Giá trị hàng tồn đến hết ngày to_dt (giá vốn nhập)."""
+    df = fetch_df(conn, """
+        SELECT p.code,
+               SUM(CASE WHEN l.kind='IN'  THEN l.qty ELSE -l.qty END) AS qty,
+               SUM(CASE WHEN l.kind='IN'  THEN l.qty*COALESCE(l.price_in,0) ELSE 0 END) AS val_in
+        FROM products p
+        LEFT JOIN inventory_ledger l ON l.pcode=p.code AND l.store=:s AND l.ts::date<=:d
+        GROUP BY p.code
+    """, {"s": store, "d": to_dt})
+    # Giá trị tồn = phân bổ theo phương pháp bình quân: nếu qty>0 => val_in * (qty / tổng qty nhập) ~ xấp xỉ
+    # Đơn giản hơn: dùng tỷ lệ giá vốn nhập / SL nhập * SL tồn (xấp xỉ bình quân).
+    df_in = fetch_df(conn, """
+        SELECT pcode,
+               SUM(CASE WHEN kind='IN' THEN qty ELSE 0 END) AS in_qty,
+               SUM(CASE WHEN kind='IN' THEN qty*COALESCE(price_in,0) ELSE 0 END) AS in_val
+        FROM inventory_ledger
+        WHERE store=:s AND ts::date<=:d
+        GROUP BY pcode
+    """, {"s": store, "d": to_dt})
+    m = pd.merge(df, df_in, how="left", left_on="code", right_on="pcode")
+    m["avg_cost"] = m.apply(lambda r: (float(r["in_val"]) / float(r["in_qty"])) if float(r.get("in_qty") or 0)>0 else 0.0, axis=1)
+    m["stock_val"] = m["avg_cost"] * m["qty"].astype(float)
+    return float(m["stock_val"].sum() if not m.empty else 0.0)
+
+def _purchases_value(conn, store: str, d_from: date, d_to: date):
+    df = fetch_df(conn, """
+        SELECT SUM(qty*COALESCE(price_in,0)) AS v
+        FROM inventory_ledger
+        WHERE store=:s AND kind='IN' AND ts::date BETWEEN :f AND :t
+    """, {"s": store, "f": d_from, "t": d_to})
+    return float(df.iloc[0]["v"] or 0.0) if not df.empty else 0.0
+
+def _sales_value(conn, store: str, d_from: date, d_to: date):
+    """Doanh thu gộp lấy theo bảng receipts/payments (sẽ bù ở Phần 5). Ở đây cho trường hợp đã có bảng sales_receipts."""
+    df = fetch_df(conn, """
+        SELECT SUM(amount) AS v
+        FROM payments
+        WHERE store=:s AND pay_date BETWEEN :f AND :t AND method IN ('CASH','BANK') AND direction='IN'
+    """, {"s": store, "f": d_from, "t": d_to})
+    return float(df.iloc[0]["v"] or 0.0) if not df.empty else 0.0
+
+def _expenses_value(conn, store: str, d_from: date, d_to: date):
+    """Chi phí tiền mặt/CK (không gồm hàng hóa) – direction OUT."""
+    df = fetch_df(conn, """
+        SELECT SUM(amount) AS v
+        FROM payments
+        WHERE store=:s AND pay_date BETWEEN :f AND :t AND method IN ('CASH','BANK') AND direction='OUT'
+    """, {"s": store, "f": d_from, "t": d_to})
+    return float(df.iloc[0]["v"] or 0.0) if not df.empty else 0.0
+
+# ---------- Trang Báo cáo ----------
+def page_baocao(conn: Connection, user: dict):
+    st.markdown("### 📊 Báo cáo tài chính")
+    store = st.session_state.get("store") or st.selectbox(
+        "Cửa hàng", fetch_df(conn, "SELECT code FROM stores ORDER BY code")["code"].tolist(), key="rpt_store"
+    )
+    colA, colB, colC = st.columns([1,1,1])
+    with colA:
+        d_from = st.date_input("Từ ngày", value=date.today().replace(day=1), key="rpt_from")
+    with colB:
+        d_to   = st.date_input("Đến ngày", value=date.today(), key="rpt_to")
+    with colC:
+        view = st.selectbox("Chọn báo cáo", ["Kết quả kinh doanh (P&L)", "Bảng cân đối kế toán", "Lưu chuyển tiền tệ"], key="rpt_view")
+
+    # ----- KQKD -----
+    if view == "Kết quả kinh doanh (P&L)":
+        stock_open = _stock_value(conn, store, d_from - timedelta(days=1))
+        stock_close = _stock_value(conn, store, d_to)
+        purchases = _purchases_value(conn, store, d_from, d_to)
+        revenue   = _sales_value(conn, store, d_from, d_to)
+
+        cogs = stock_open + purchases - stock_close
+        gross = revenue - cogs
+        expenses = _expenses_value(conn, store, d_from, d_to)
+        depreciation = float(fetch_df(conn, """
+            SELECT COALESCE(SUM(depr_amount),0) AS v
+            FROM tscd_depr_log
+            WHERE store=:s AND depr_date BETWEEN :f AND :t
+        """, {"s": store, "f": d_from, "t": d_to}).iloc[0]["v"] or 0.0)
+        op_profit = gross - expenses - depreciation
+
+        df = pd.DataFrame([
+            ["Doanh thu", revenue],
+            ["Giá vốn (tính theo tồn)", -cogs],
+            ["Lãi gộp", gross],
+            ["Chi phí vận hành", -expenses],
+            ["Khấu hao", -depreciation],
+            ["Lợi nhuận thuần", op_profit]
+        ], columns=["Khoản mục","Giá trị (VND)"])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.metric("Lợi nhuận thuần", f"{op_profit:,.0f} VND")
+
+    # ----- Bảng cân đối -----
+    elif view == "Bảng cân đối kế toán":
+        inv = _stock_value(conn, store, d_to)
+        cash = float(fetch_df(conn, """
+            SELECT COALESCE(SUM(CASE WHEN direction='IN' THEN amount ELSE -amount END),0) AS v
+            FROM payments
+            WHERE store=:s AND pay_date<=:t AND method IN ('CASH','BANK')
+        """, {"s": store, "t": d_to}).iloc[0]["v"] or 0.0)
+        # TSCD:
+        tscd_df = fetch_df(conn, "SELECT cost,accum_dep FROM tscd WHERE store=:s", {"s": store})
+        fa_cost = float(tscd_df["cost"].sum() if not tscd_df.empty else 0.0)
+        fa_acc  = float(tscd_df["accum_dep"].sum() if not tscd_df.empty else 0.0)
+        fa_net  = fa_cost - fa_acc
+        assets = inv + cash + fa_net
+
+        # Nguồn vốn (đơn giản: Vốn chủ sở hữu = tổng tài sản vì không theo dõi công nợ)
+        df = pd.DataFrame([
+            ["Tài sản ngắn hạn - Tiền", cash],
+            ["Tài sản ngắn hạn - Hàng tồn", inv],
+            ["Tài sản dài hạn - TSCD (ròng)", fa_net],
+            ["Tổng tài sản", assets],
+            ["Vốn chủ sở hữu (tương đương)", assets]
+        ], columns=["Khoản mục","Giá trị (VND)"])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # ----- Lưu chuyển tiền tệ -----
+    else:
+        df = fetch_df(conn, """
+            SELECT pay_date, method, direction, ref, note, amount
+            FROM payments
+            WHERE store=:s AND pay_date BETWEEN :f AND :t
+            ORDER BY pay_date
+        """, {"s": store, "f": d_from, "t": d_to})
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        cash_in  = float(df[df["direction"]=="IN"]["amount"].sum() if not df.empty else 0.0)
+        cash_out = float(df[df["direction"]=="OUT"]["amount"].sum() if not df.empty else 0.0)
+        st.metric("Tiền vào", f"{cash_in:,.0f} VND")
+        st.metric("Tiền ra", f"{cash_out:,.0f} VND")
+        st.metric("Lưu chuyển thuần", f"{(cash_in-cash_out):,.0f} VND")
+
+# ---------- TSCD ----------
+def _tscd_monthly_depr(cost: float, life_months: int) -> float:
+    if not cost or not life_months or life_months <= 0: return 0.0
+    return float(cost) / float(life_months)
+
+def page_tscd(conn: Connection, user: dict):
+    st.markdown("### 🧱 Tài sản cố định")
+    tabs = st.tabs(["📄 Danh mục TSCD", "🧮 Tính/ghi khấu hao"])
+    # --- Danh mục (CRUD) ---
+    with tabs[0]:
+        if not has_perm(user, "ASSET_EDIT"):
+            st.warning("Bạn không có quyền quản lý TSCD (ASSET_EDIT).")
+        else:
+            store = st.session_state.get("store") or st.selectbox(
+                "Cửa hàng", fetch_df(conn, "SELECT code FROM stores ORDER BY code")["code"].tolist(), key="fa_store"
+            )
+            df = fetch_df(conn, "SELECT * FROM tscd WHERE store=:s ORDER BY code", {"s": store})
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            st.markdown("#### ➕ Thêm mới")
+            col1, col2, col3, col4 = st.columns([1,2,1,1])
+            code = col1.text_input("Mã TS", key="fa_code")
+            name = col2.text_input("Tên TS", key="fa_name")
+            cost = col3.number_input("Nguyên giá", value=0.0, step=1_000_000.0, min_value=0.0, key="fa_cost")
+            life = col4.number_input("Số tháng KH", value=60, step=1, min_value=1, key="fa_life")
+            col5, col6 = st.columns([1,1])
+            acq  = col5.date_input("Ngày mua", value=date.today(), key="fa_acq")
+            note = col6.text_input("Ghi chú", key="fa_note")
+            if st.button("💾 Lưu TSCD", type="primary", key="fa_save"):
+                if not code or not name:
+                    st.error("Nhập mã & tên.")
+                else:
+                    run_sql(conn, """
+                        INSERT INTO tscd(code,store,name,acq_date,cost,life_months,accum_dep,note)
+                        VALUES(:c,:s,:n,:d,:cost,:life,0,:note)
+                        ON CONFLICT (code) DO UPDATE
+                        SET store=:s, name=:n, acq_date=:d, cost=:cost, life_months=:life, note=:note
+                    """, {"c": code, "s": store, "n": name, "d": acq, "cost": cost, "life": int(life), "note": note})
+                    write_audit(conn, "ASSET_SAVE", code)
+                    st.success("Đã lưu TSCD.")
+
+            st.markdown("#### 🗑️ Xoá")
+            if not df.empty:
+                del_code = st.selectbox("Chọn TS cần xoá", df["code"].tolist(), key="fa_del")
+                if st.button("Xoá TSCD", key="fa_del_btn"):
+                    run_sql(conn, "DELETE FROM tscd WHERE code=:c", {"c": del_code})
+                    write_audit(conn, "ASSET_DELETE", del_code)
+                    st.success("Đã xoá.")
+
+    # --- Khấu hao ---
+    with tabs[1]:
+        store = st.session_state.get("store") or st.selectbox(
+            "Cửa hàng", fetch_df(conn, "SELECT code FROM stores ORDER BY code")["code"].tolist(), key="kh_store"
+        )
+        period = st.date_input("Kỳ khấu hao (lấy theo tháng)", value=date.today(), key="kh_period")
+        ym = period.replace(day=1)
+        df = fetch_df(conn, "SELECT code,name,cost,life_months,accum_dep FROM tscd WHERE store=:s ORDER BY code", {"s": store})
+        if df.empty:
+            st.info("Chưa có TSCD.")
+        else:
+            df["kh_thang"] = df.apply(lambda r: _tscd_monthly_depr(float(r["cost"]), int(r["life_months"])), axis=1)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            if st.button("📌 Ghi khấu hao tháng này", type="primary", key="kh_post"):
+                for _, r in df.iterrows():
+                    kh = float(r["kh_thang"])
+                    if kh <= 0: continue
+                    # log khấu hao
+                    run_sql(conn, """
+                        INSERT INTO tscd_depr_log(depr_date, store, code, depr_amount)
+                        VALUES(:d, :s, :c, :v)
+                        ON CONFLICT DO NOTHING
+                    """, {"d": ym, "s": store, "c": r["code"], "v": kh})
+                    # cộng dồn
+                    run_sql(conn, "UPDATE tscd SET accum_dep=COALESCE(accum_dep,0)+:v WHERE code=:c",
+                           {"v": kh, "c": r["code"]})
+                write_audit(conn, "ASSET_DEPR", f"{store} {ym.isoformat()}")
+                st.success("Đã ghi khấu hao.")
+# ============================================================
+# PHẦN 5/5 — THU & CHI (CASH / BANK, không theo sản phẩm)
+# ============================================================
+
+def page_doanhthu(conn: Connection, user: dict):
+    st.markdown("### 💰 Thu & Chi (tiền mặt / chuyển khoản)")
+    store = st.session_state.get("store","")
+
+    tab_in, tab_out, tab_rep = st.tabs(["➕ Ghi thu", "➖ Ghi chi", "📊 Báo cáo"])
+
+    # ---------- Ghi thu ----------
+    with tab_in:
+        col1, col2 = st.columns([1,1])
+        with col1:
+            d = st.date_input("Ngày thu", value=date.today(), key="rev_in_date")
+            method = st.selectbox("Phương thức", ["CASH","BANK"], key="rev_in_method")
+            amount = st.number_input("Số tiền (VND)", value=0.0, step=1000.0, min_value=0.0, key="rev_in_amount")
+        with col2:
+            ref    = st.text_input("Số CT / Mã GD", key="rev_in_ref")
+            payer  = st.text_input("Người nộp / Diễn giải ngắn", key="rev_in_payer")
+            note   = st.text_area("Ghi chú (tùy chọn)", key="rev_in_note")
+
+        if st.button("💾 Ghi thu", type="primary", use_container_width=True, key="rev_in_btn"):
+            if amount <= 0:
+                st.error("Nhập số tiền > 0.")
+            else:
+                run_sql(conn, """
+                    INSERT INTO payments(pay_date, store, method, direction, amount, ref, note, actor)
+                    VALUES (:d, :s, :m, 'IN', :a, :r, :n, :u)
+                """, {"d": d, "s": store, "m": method, "a": float(amount),
+                      "r": ref or "", "n": note or (payer or ""), "u": user.get("email","sys")})
+                write_audit(conn, "REV_IN", f"{method} {amount}")
+                st.success("✅ Đã ghi thu.")
+                st.rerun()
+
+    # ---------- Ghi chi ----------
+    with tab_out:
+        col1, col2 = st.columns([1,1])
+        with col1:
+            d = st.date_input("Ngày chi", value=date.today(), key="rev_out_date")
+            method = st.selectbox("Phương thức", ["CASH","BANK"], key="rev_out_method")
+            amount = st.number_input("Số tiền (VND)", value=0.0, step=1000.0, min_value=0.0, key="rev_out_amount")
+        with col2:
+            ref    = st.text_input("Số CT / Mã GD", key="rev_out_ref")
+            payee  = st.text_input("Người nhận / Diễn giải ngắn", key="rev_out_payee")
+            note   = st.text_area("Ghi chú (tùy chọn)", key="rev_out_note")
+
+        if st.button("💾 Ghi chi", type="primary", use_container_width=True, key="rev_out_btn"):
+            if amount <= 0:
+                st.error("Nhập số tiền > 0.")
+            else:
+                run_sql(conn, """
+                    INSERT INTO payments(pay_date, store, method, direction, amount, ref, note, actor)
+                    VALUES (:d, :s, :m, 'OUT', :a, :r, :n, :u)
+                """, {"d": d, "s": store, "m": method, "a": float(amount),
+                      "r": ref or "", "n": note or (payee or ""), "u": user.get("email","sys")})
+                write_audit(conn, "REV_OUT", f"{method} {amount}")
+                st.success("✅ Đã ghi chi.")
+                st.rerun()
+
+    # ---------- Báo cáo ----------
+    with tab_rep:
+        col1, col2, col3 = st.columns([1,1,1])
+        with col1:
+            fr = st.date_input("Từ ngày", value=date.today().replace(day=1), key="rev_rep_from")
+        with col2:
+            to = st.date_input("Đến ngày", value=date.today(), key="rev_rep_to")
+        with col3:
+            m  = st.selectbox("Phương thức", ["Tất cả","CASH","BANK"], key="rev_rep_method")
+
+        cond = "store=:s AND pay_date BETWEEN :f AND :t"
+        prm  = {"s": store, "f": fr, "t": to}
+        if m != "Tất cả":
+            cond += " AND method=:m"; prm["m"] = m
+
+        df = fetch_df(conn, f"""
+            SELECT pay_date AS ngày, method AS phương_thức, direction AS loại, amount AS số_tiền,
+                   ref AS chứng_từ, note AS ghi_chú, actor AS người_nhập
+            FROM payments
+            WHERE {cond}
+            ORDER BY pay_date
+        """, prm)
+
+        st.dataframe(df, use_container_width=True, hide_index=True, height=350)
+
+        # Tổng hợp
+        if df.empty:
+            cash_in = bank_in = cash_out = bank_out = 0.0
+        else:
+            cash_in  = float(df[(df["phương_thức"]=="CASH") & (df["loại"]=="IN")]["số_tiền"].sum())
+            bank_in  = float(df[(df["phương_thức"]=="BANK") & (df["loại"]=="IN")]["số_tiền"].sum())
+            cash_out = float(df[(df["phương_thức"]=="CASH") & (df["loại"]=="OUT")]["số_tiền"].sum())
+            bank_out = float(df[(df["phương_thức"]=="BANK") & (df["loại"]=="OUT")]["số_tiền"].sum())
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Thu CASH", f"{cash_in:,.0f} VND")
+        c2.metric("Thu BANK", f"{bank_in:,.0f} VND")
+        c3.metric("Chi CASH", f"{cash_out:,.0f} VND")
+        c4.metric("Chi BANK", f"{bank_out:,.0f} VND")
+        c5.metric("Cân đối", f"{(cash_in+bank_in-cash_out-bank_out):,.0f} VND")
+
+        # Xuất CSV
+        st.download_button(
+            "⬇️ Xuất CSV",
+            (df.to_csv(index=False).encode("utf-8") if not df.empty else "".encode("utf-8")),
+            file_name=f"thu_chi_{fr}_{to}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+# ---------- Cập nhật router để bật 'Doanh thu' ----------
+def router():
+    _ensure_session_defaults()
+    conn = get_conn()
+    user = require_login(conn)
+    header_top(conn, user)
+    menu = sidebar_menu(conn, user)
+
+    if menu == "Dashboard":
+        page_dashboard(conn, user)
+    elif menu == "Danh mục":
+        page_danhmuc(conn, user)
+    elif menu == "Cửa hàng":
+        page_cuahang(conn, user)
+    elif menu == "Người dùng":
+        page_nguoidung(conn, user)
+    elif menu == "Kho":
+        page_kho(conn, user)
+    elif menu == "Sản xuất":
+        page_sanxuat(conn, user)
+    elif menu == "Báo cáo":
+        page_baocao(conn, user)
+    elif menu == "TSCD":
+        page_tscd(conn, user)
+    elif menu == "Doanh thu":
+        page_doanhthu(conn, user)
+    elif menu == "Nhật ký":
+        if has_perm(user, "AUDIT_VIEW"):
+            df = fetch_df(conn, "SELECT ts,actor,action,detail FROM syslog ORDER BY ts DESC LIMIT 300")
+            st.markdown("### 🗒️ Nhật ký hệ thống")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.warning("Bạn không có quyền xem nhật ký.")
+
