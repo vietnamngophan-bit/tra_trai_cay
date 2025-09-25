@@ -177,15 +177,6 @@ def router():
 
     if menu == "Nhật ký":
         page_nhatky(conn, user)
-    elif menu == "Dashboard":
-        # phần 2 sẽ ghi đè
-        st.info("Dashboard (KPIs / biểu đồ) — xem Phần 2.")
-    elif menu == "Danh mục":
-        st.info("Quản lý danh mục & sản phẩm — xem Phần 2.")
-    elif menu == "Cửa hàng":
-        st.info("Quản lý cửa hàng — xem Phần 2.")
-    elif menu == "Người dùng":
-        st.info("Quản lý người dùng — xem Phần 2.")
 
 if __name__ == "__main__":
     router()
