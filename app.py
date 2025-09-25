@@ -1242,6 +1242,7 @@ def page_ai(conn):
 def main():
 
     conn = get_conn()
+    conn_local = conn
     user = require_login()
     choice = sidebar_menu(user)
 
