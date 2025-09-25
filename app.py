@@ -143,3 +143,152 @@ def main_frame():
 # ------------------- ENTRY -------------------
 if __name__=="__main__":
     main_frame()
+# ============================================================
+# app.py — Phần 2/4: Dashboard + Danh mục + Cửa hàng + Người dùng
+# ============================================================
+
+# ------------------- DASHBOARD -------------------
+def page_dashboard(conn, user):
+    st.markdown("### 📊 Dashboard")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        df = fetch_df(conn,"SELECT COUNT(*) AS n FROM products")
+        st.metric("Sản phẩm", int(df.iloc[0]["n"]))
+    with col2:
+        df = fetch_df(conn,"SELECT COUNT(*) AS n FROM stores")
+        st.metric("Cửa hàng", int(df.iloc[0]["n"]))
+    with col3:
+        df = fetch_df(conn,"SELECT COUNT(*) AS n FROM users")
+        st.metric("Người dùng", int(df.iloc[0]["n"]))
+
+# ------------------- DANH MỤC -------------------
+def page_danhmuc(conn, user):
+    st.markdown("### 📂 Danh mục sản phẩm")
+    df = fetch_df(conn,"SELECT code,name FROM categories ORDER BY code")
+    st.dataframe(df, use_container_width=True)
+    mode = st.radio("Chế độ", ["Tạo mới","Sửa/Xóa"], horizontal=True)
+
+    if mode=="Tạo mới":
+        code = st.text_input("Mã DM")
+        name = st.text_input("Tên danh mục")
+        if st.button("💾 Lưu"):
+            if code and name:
+                run_sql(conn,"INSERT INTO categories(code,name) VALUES(:c,:n) ON CONFLICT(code) DO UPDATE SET name=:n",
+                        {"c":code,"n":name})
+                st.success("Đã lưu danh mục")
+                st.rerun()
+    else:
+        if df.empty:
+            st.info("Chưa có danh mục.")
+            return
+        sel = st.selectbox("Chọn", df["code"])
+        row = df[df["code"]==sel].iloc[0]
+        name = st.text_input("Tên danh mục", row["name"])
+        c1,c2 = st.columns(2)
+        with c1:
+            if st.button("💾 Cập nhật"):
+                run_sql(conn,"UPDATE categories SET name=:n WHERE code=:c",{"n":name,"c":sel})
+                st.success("Đã cập nhật"); st.rerun()
+        with c2:
+            if st.button("🗑️ Xóa"):
+                run_sql(conn,"DELETE FROM categories WHERE code=:c",{"c":sel})
+                st.success("Đã xóa"); st.rerun()
+
+# ------------------- CỬA HÀNG -------------------
+def page_cuahang(conn, user):
+    st.markdown("### 🏬 Quản lý cửa hàng")
+    df = fetch_df(conn,"SELECT code,name,addr,note FROM stores ORDER BY code")
+    st.dataframe(df,use_container_width=True)
+    mode = st.radio("Chế độ",["Tạo mới","Sửa/Xóa"],horizontal=True)
+
+    if mode=="Tạo mới":
+        code = st.text_input("Mã cửa hàng")
+        name = st.text_input("Tên cửa hàng")
+        addr = st.text_input("Địa chỉ")
+        note = st.text_area("Ghi chú")
+        if st.button("💾 Lưu"):
+            run_sql(conn,"INSERT INTO stores(code,name,addr,note) VALUES(:c,:n,:a,:t) ON CONFLICT(code) DO UPDATE SET name=:n,addr=:a,note=:t",
+                    {"c":code,"n":name,"a":addr,"t":note})
+            st.success("Đã lưu"); st.rerun()
+    else:
+        if df.empty:
+            st.info("Chưa có cửa hàng."); return
+        sel = st.selectbox("Chọn", df["code"])
+        row = df[df["code"]==sel].iloc[0]
+        name = st.text_input("Tên", row["name"])
+        addr = st.text_input("Địa chỉ", row["addr"] or "")
+        note = st.text_area("Ghi chú", row["note"] or "")
+        c1,c2 = st.columns(2)
+        with c1:
+            if st.button("💾 Cập nhật"):
+                run_sql(conn,"UPDATE stores SET name=:n,addr=:a,note=:t WHERE code=:c",
+                        {"n":name,"a":addr,"t":note,"c":sel})
+                st.success("Đã cập nhật"); st.rerun()
+        with c2:
+            if st.button("🗑️ Xóa"):
+                run_sql(conn,"DELETE FROM stores WHERE code=:c",{"c":sel})
+                st.success("Đã xóa"); st.rerun()
+
+# ------------------- NGƯỜI DÙNG -------------------
+def page_nguoidung(conn, user):
+    st.markdown("### 👥 Quản lý người dùng")
+    df = fetch_df(conn,"SELECT email,display,role,store_code FROM users ORDER BY email")
+    st.dataframe(df,use_container_width=True)
+    mode = st.radio("Chế độ",["Tạo mới","Sửa/Xóa"],horizontal=True)
+
+    if mode=="Tạo mới":
+        email = st.text_input("Email")
+        display = st.text_input("Tên hiển thị")
+        pw = st.text_input("Mật khẩu", type="password")
+        role = st.selectbox("Vai trò",["User","Admin","SuperAdmin"])
+        store = st.text_input("Mã cửa hàng (bỏ trống nếu SuperAdmin)")
+        if st.button("💾 Lưu"):
+            if email and pw:
+                run_sql(conn,"INSERT INTO users(email,display,password,role,store_code) VALUES(:e,:d,:p,:r,:s) ON CONFLICT(email) DO UPDATE SET display=:d,role=:r,store_code=:s",
+                        {"e":email,"d":display,"p":sha256(pw),"r":role,"s":(store if role!="SuperAdmin" else None)})
+                st.success("Đã lưu user"); st.rerun()
+    else:
+        if df.empty:
+            st.info("Chưa có user."); return
+        sel = st.selectbox("Chọn user", df["email"])
+        row = df[df["email"]==sel].iloc[0]
+        display = st.text_input("Tên hiển thị", row["display"] or "")
+        role = st.selectbox("Vai trò",["User","Admin","SuperAdmin"], index=["User","Admin","SuperAdmin"].index(row["role"]))
+        store = st.text_input("Mã cửa hàng", row["store_code"] or "")
+        newpw = st.text_input("Mật khẩu mới (nếu đổi)", type="password")
+        c1,c2 = st.columns(2)
+        with c1:
+            if st.button("💾 Cập nhật"):
+                if newpw:
+                    run_sql(conn,"UPDATE users SET display=:d,role=:r,store_code=:s,password=:p WHERE email=:e",
+                            {"d":display,"r":role,"s":(store if role!="SuperAdmin" else None),"p":sha256(newpw),"e":sel})
+                else:
+                    run_sql(conn,"UPDATE users SET display=:d,role=:r,store_code=:s WHERE email=:e",
+                            {"d":display,"r":role,"s":(store if role!="SuperAdmin" else None),"e":sel})
+                st.success("Đã cập nhật"); st.rerun()
+        with c2:
+            if st.button("🗑️ Xóa"):
+                run_sql(conn,"DELETE FROM users WHERE email=:e",{"e":sel})
+                st.success("Đã xóa"); st.rerun()
+
+# ------------------- CẬP NHẬT MAIN FRAME -------------------
+def main_frame():
+    conn = get_conn()
+    user = require_login(conn)
+    header_top(conn, user)
+
+    menu = st.sidebar.radio("Chọn chức năng",
+        ["Dashboard","Danh mục","Cửa hàng","Người dùng","Nhật ký"],
+        index=0)
+    st.sidebar.caption("DB: Postgres (Supabase)")
+
+    if menu=="Dashboard": page_dashboard(conn,user)
+    elif menu=="Danh mục": page_danhmuc(conn,user)
+    elif menu=="Cửa hàng": page_cuahang(conn,user)
+    elif menu=="Người dùng": page_nguoidung(conn,user)
+    elif menu=="Nhật ký":
+        if has_perm(user,"AUDIT_VIEW") or user.get("role")=="SuperAdmin":
+            df = fetch_df(conn,"SELECT ts,actor,action,detail FROM syslog ORDER BY ts DESC LIMIT 200")
+            st.dataframe(df,use_container_width=True)
+        else:
+            st.warning("Không có quyền xem nhật ký.")
