@@ -365,9 +365,8 @@ def page_doanhthu(conn, user):
     # Form ghi thu
     with st.form("form_rev", clear_on_submit=True):
         d = st.date_input("Ngày", value=datetime.now().date())
-t = st.time_input("Giờ", value=datetime.now().time())
-ts = datetime.combine(d, t)
-
+        t = st.time_input("Giờ", value=datetime.now().time())
+        ts = datetime.combine(d, t)
         method = st.selectbox("Hình thức", ["TM","CK"])
         amount = st.number_input("Số tiền (đ)", value=0.0, min_value=0.0, step=1000.0)
         note = st.text_input("Ghi chú")
