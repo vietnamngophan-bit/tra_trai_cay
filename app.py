@@ -269,32 +269,7 @@ def sidebar_menu(conn: Connection, user: Dict[str, Any]) -> str:
 
     return menu
 
-# ------------------- PLACEHOLDER ROUTES (sẽ viết ở Phần 2–5) -------------------
-def route_part2_placeholder(menu: str):
-    if menu == "Dashboard":
-        st.info("Dashboard sẽ được hoàn thiện ở **Phần 2**.")
-    elif menu == "Danh mục":
-        st.info("Danh mục (Sản phẩm, Danh mục, Công thức) sẽ có ở **Phần 2**.")
-    elif menu == "Cửa hàng":
-        st.info("Quản lý cửa hàng (CRUD) sẽ nằm ở **Phần 2**.")
-    elif menu == "Người dùng":
-        st.info("Quản lý người dùng (CRUD + phân quyền) sẽ nằm ở **Phần 2**.")
 
-def route_part3_placeholder(menu: str):
-    if menu == "Kho":
-        st.info("Kho (Nhập/Xuất/Kiểm kê) + Tồn số **cốc** → ở **Phần 3**.")
-    elif menu == "Sản xuất":
-        st.info("Sản xuất **CỐT** (1 bước) & **MỨT** (2 bước) → ở **Phần 3**.")
-
-def route_part4_placeholder(menu: str):
-    if menu == "Báo cáo":
-        st.info("Báo cáo Tồn kho/Trị giá, Tài chính (BCKQKD, CĐKT, LCTT) → ở **Phần 4**.")
-    elif menu == "TSCD":
-        st.info("Tài sản cố định (thêm/sửa/xóa, khấu hao, báo cáo) → ở **Phần 4**.")
-
-def route_part5_placeholder(menu: str):
-    if menu == "Doanh thu":
-        st.info("Doanh thu (CASH/BANK), xuất Excel/PDF, tra cứu… → ở **Phần 5**.")
 
 def route_audit(conn: Connection, user: Dict[str, Any], menu: str):
     if menu == "Nhật ký":
