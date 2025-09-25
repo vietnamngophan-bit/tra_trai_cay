@@ -344,11 +344,7 @@ def page_users(conn: Connection, user: dict):
                 run_sql(conn,"DELETE FROM users WHERE email=:e",{"e":pick})
                 write_audit(conn,"USER_DELETE",pick); st.success("Đã xóa."); st.rerun()
 
-# ---------- ROUTER DUY NHẤT ----------
-def router():
-    conn = get_conn()
-    user = require_login(conn)
-    header_top(conn, user)
+
 
     st.sidebar.markdown("### 🏪 Cửa hàng")
     df_st = fetch_df(conn,"SELECT code,name FROM stores ORDER BY name")
@@ -362,17 +358,7 @@ def router():
     menu = st.sidebar.radio("", ["Dashboard","Danh mục","Cửa hàng","Người dùng","Nhật ký"],
                             index=0, label_visibility="collapsed")
 
-    if menu == "Dashboard":   page_dashboard(conn, user)
-    elif menu == "Danh mục":  page_danhmuc(conn, user)
-    elif menu == "Cửa hàng":  page_cuahang(conn, user)
-    elif menu == "Người dùng":page_users(conn, user)
-    elif menu == "Nhật ký":   page_nhatky(conn, user)
-
-if __name__ == "__main__":
-    router()
-# =========================
-# PHẦN 3/5 — KHO & SẢN XUẤT
-# =========================
+    
 
 # ---------- helpers tồn kho ----------
 def _stock_of(conn, store: str, pcode: str, to_dt: date | None = None) -> float:
