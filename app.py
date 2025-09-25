@@ -104,14 +104,20 @@ def _sa_exec_auto(self, statement, *multiparams, **kwargs):
     return _ORIG_SA_EXEC(self, statement, *multiparams, **kwargs)
 _SAConnection.execute = _sa_exec_auto
 
+# === REPLACE: run_sql ===
 def run_sql(conn, sql, params=None):
-    """Execute a SQL string on both PG/SQLite. With PG we pass dict params."""
+    """
+    Chạy SQL cho cả SQLite & Postgres.
+    - Với Postgres: nếu params là list/tuple (dùng ?), đổi sang dict tên :p1,:p2...
+    - Tuyệt đối KHÔNG dùng params or () với Postgres => phải là dict.
+    """
+    global _IS_PG
     if _IS_PG and isinstance(params, (list, tuple)):
         sql, params = _qmark_to_named(sql, params)
     res = conn.execute(text(sql) if _IS_PG else sql, params or {})
     try:
         conn.commit()
-    except:
+    except Exception:
         pass
     return res
 
