@@ -619,31 +619,7 @@ def router():
     header_top(conn, user)
     menu = sidebar_menu(conn, user)
 
-    if menu == "Dashboard":
-        page_dashboard(conn, user)
-    elif menu == "Danh mục":
-        page_danhmuc(conn, user)
-    elif menu == "Cửa hàng":
-        page_cuahang(conn, user)
-    elif menu == "Người dùng":
-        page_nguoidung(conn, user)
-    elif menu == "Nhật ký":
-        if has_perm(user, "AUDIT_VIEW"):
-            df = fetch_df(conn, "SELECT ts,actor,action,detail FROM syslog ORDER BY ts DESC LIMIT 300")
-            st.markdown("### 🗒️ Nhật ký hệ thống")
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else:
-            st.warning("Bạn không có quyền xem nhật ký.")
-    elif menu == "Kho":
-        st.info("Kho sẽ được cung cấp đầy đủ ở **Phần 3**.")
-    elif menu == "Sản xuất":
-        st.info("Sản xuất (CỐT/MỨT) sẽ ở **Phần 3**.")
-    elif menu == "Báo cáo":
-        st.info("Báo cáo sẽ ở **Phần 4**.")
-    elif menu == "TSCD":
-        st.info("TSCD sẽ ở **Phần 4**.")
-    elif menu == "Doanh thu":
-        st.info("Doanh thu sẽ ở **Phần 5**.")
+    
 # ============================================================
 # PHẦN 3/5 — KHO (Nhập/Xuất/Tồn/KK) + SẢN XUẤT (CỐT & MỨT)
 # ============================================================
