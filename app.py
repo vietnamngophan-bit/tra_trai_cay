@@ -316,27 +316,75 @@ conn = get_conn()
 ensure_min_schema(conn)
 
 # --- seed dữ liệu tối thiểu (an toàn, ON CONFLICT/REPLACE)
+# === REPLACE: seed_min_data ===
 def seed_min_data(conn):
-    # 1 store mặc định
+    """
+    Nạp dữ liệu mẫu tối thiểu: store, user admin, categories, products, sample formulas.
+    An toàn chạy lại nhiều lần.
+    """
+    # ----- Stores -----
     run_sql(conn, """
-        INSERT OR REPLACE INTO stores(code,name,address,note)
-        VALUES('HOSEN','Kho HOSEN','Đà Nẵng','store mặc định')
+        INSERT INTO stores(code, name) VALUES
+        ('HOSEN','HOSEN')
+        ON CONFLICT (code) DO UPDATE SET name=EXCLUDED.name;
     """)
-    # tài khoản admin mặc định
+
+    # ----- Users (mặc định admin@example.com / admin) -----
+    # quyền đủ: KHO, SANXUAT, DANHMUC, DOANHTHU, BAOCAO, USERS, TSCD, TAICHINH, CT_EDIT
     run_sql(conn, """
-        INSERT OR REPLACE INTO users(email,display,password,role,store_code,perms)
-        VALUES(?,?,?,?,?,?)
-    """, ("admin@example.com","SuperAdmin","admin","SuperAdmin","HOSEN",
-          "KHO,BAOCAO,SANXUAT,DM,USERS,CT_EDIT"))
-    # vài sản phẩm mẫu để chạy thử
-    samples = [
-        ("TRA_TUOI", "Trà tươi", "kg", "TRAI_CAY"),
-        ("DUONG", "Đường", "kg", "PHU_GIA"),
-        ("COT_CAM", "Cốt cam", "kg", "COT"),
-        ("MUT_CAM", "Mứt cam", "kg", "MUT"),
-    ]
-    for r in samples:
-        run_sql(conn, "INSERT OR REPLACE INTO products(code,name,uom,cat_code) VALUES(?,?,?,?)", r)
+        INSERT INTO users(email, display, password, role, store_code, perms)
+        VALUES ('admin@example.com','SuperAdmin','admin','SuperAdmin','HOSEN',
+                'KHO,SANXUAT,DANHMUC,DOANHTHU,BAOCAO,USERS,TSCD,TAICHINH,CT_EDIT')
+        ON CONFLICT (email) DO UPDATE SET
+            display=EXCLUDED.display,
+            password=EXCLUDED.password,
+            role=EXCLUDED.role,
+            store_code=EXCLUDED.store_code,
+            perms=EXCLUDED.perms;
+    """)
+
+    # ----- Categories -----
+    run_sql(conn, """
+        INSERT INTO categories(code, name) VALUES
+        ('TRAI_CAY','Trái cây'),
+        ('COT','Cốt'),
+        ('MUT','Mứt'),
+        ('PHU_GIA','Phụ gia')
+        ON CONFLICT (code) DO UPDATE SET name=EXCLUDED.name;
+    """)
+
+    # ----- Products mẫu -----
+    run_sql(conn, """
+        INSERT INTO products(code, name, uom, cat_code) VALUES
+        ('CAM_TUOI','Cam tươi','kg','TRAI_CAY'),
+        ('DUONG','Đường','kg','PHU_GIA'),
+        ('COT_CAM','Cốt cam','kg','COT'),
+        ('MUT_CAM','Mứt cam','kg','MUT')
+        ON CONFLICT (code) DO UPDATE SET
+            name=EXCLUDED.name, uom=EXCLUDED.uom, cat_code=EXCLUDED.cat_code;
+    """)
+
+    # ----- Formulas mẫu -----
+    # CỐT: có recovery & cups_per_kg; NVL chỉ từ TRÁI CÂY
+    run_sql(conn, """
+        INSERT INTO formulas(code, name, type, output_pcode, output_uom, recovery,
+                             cups_per_kg, fruits_csv, additives_json, note)
+        VALUES
+        ('CT_COT_CAM','Cốt cam chuẩn','COT','COT_CAM','kg',1.10, 10.0,
+         'CAM_TUOI', '{"DUONG":0.05}', ''),
+        ('CT_MUT_CAM_TUOI','Mứt cam từ trái','MUT','MUT_CAM','kg',1.0, 0.0,
+         'CAM_TUOI', '{"DUONG":0.10}', 'SRC=TRAI_CAY'),
+        ('CT_MUT_CAM_TU_COT','Mứt cam từ cốt','MUT','MUT_CAM','kg',1.0, 0.0,
+         'COT_CAM', '{"DUONG":0.08}', 'SRC=COT')
+        ON CONFLICT (code) DO UPDATE SET
+            name=EXCLUDED.name, type=EXCLUDED.type, output_pcode=EXCLUDED.output_pcode,
+            output_uom=EXCLUDED.output_uom, recovery=EXCLUDED.recovery,
+            cups_per_kg=EXCLUDED.cups_per_kg, fruits_csv=EXCLUDED.fruits_csv,
+            additives_json=EXCLUDED.additives_json, note=EXCLUDED.note;
+    """)
+
+    # ----- Nhật ký hệ thống -----
+    run_sql(conn, "INSERT INTO syslog(action, detail) VALUES ('SEED','Seed minimal data done');")
 
 seed_min_data(conn)
 
