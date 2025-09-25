@@ -765,24 +765,93 @@ def page_sanxuat(conn: Connection, user: dict):
             LIMIT 500
         """, {"s": store})
         st.dataframe(df, use_container_width=True, hide_index=True)# Đang dùng email làm khóa chính => truyền val_col="email"
-# ============ ROUTER TỐI GIẢN: CHỈ "Kho" & "Sản xuất" ============
-def __router_kho_sx_only():
-    conn = get_conn()
-    user = require_login(conn)
-    header_top(conn, user)
 
-    st.sidebar.markdown("## 📌 Chức năng")
-    menu = st.sidebar.radio("Đi tới", ["Kho", "Sản xuất"], index=0, key="__menu_kho_sx__")
-    st.sidebar.divider()
-    st.sidebar.caption("DB: Postgres (Supabase)")
+# ========= ROUTER CỐ ĐỊNH (dùng cho toàn bộ app) =========
 
-    if menu == "Kho":
-        page_kho(conn, user)        # <- function Kho của bạn
-    else:
-        page_sanxuat(conn, user)    # <- function Sản xuất của bạn
+# Khai báo menu chuẩn: (Nhãn, Tên hàm, Quyền tối thiểu hoặc None)
+_MENU_ORDER = [
+    ("Dashboard",  "page_dashboard",   None),
+    ("Danh mục",   "page_catalog",     "CAT_VIEW"),
+    ("Kho",        "page_kho",         "INV_VIEW"),
+    ("Sản xuất",   "page_sanxuat",     "MFG_VIEW"),
+    ("Doanh thu",  "page_doanhthu",    "REV_VIEW"),
+    ("Báo cáo",    "page_baocao",      "RPT_VIEW"),
+    ("TSCD",       "page_tscd",        "FA_VIEW"),
+    ("Nhật ký",    "page_audit",       "AUDIT_VIEW"),
+    ("Cửa hàng",   "page_stores",      "STORE_EDIT"),
+    ("Người dùng", "page_users",       "USER_EDIT"),
+]
 
+def _has_perm(user: dict, perm: str | None) -> bool:
+    if perm is None:
+        return True
+    if not user:
+        return False
+    if user.get("role") == "SuperAdmin":
+        return True
+    perms = (user.get("perms") or "").split(",")
+    return perm in perms
+
+def _store_selector(conn, user):
+    st.sidebar.markdown("### 🏬 Cửa hàng")
+    try:
+        df = fetch_df(conn, "SELECT code,name FROM stores ORDER BY name")
+    except Exception:
+        df = pd.DataFrame(columns=["code","name"])
+
+    opts = [("","(Tất cả)")] + [(r["code"], f'{r["name"]} ({r["code"]})') for _,r in df.iterrows()]
+    codes = [o[0] for o in opts]
+    labels = [o[1] for o in opts]
+
+    # giá trị ban đầu
+    cur = st.session_state.get("store", user.get("store",""))
+    if cur not in codes:
+        cur = ""
+
+    pick = st.sidebar.selectbox(
+        label="Đang thao tác tại",
+        options=labels,
+        index=labels.index(labels[codes.index(cur)]) if cur in codes else 0,
+        key="__sb_store__",
+    )
+    # map label -> code
+    st.session_state["store"] = codes[labels.index(pick)]
+
+def router(conn, user):
+    """Router duy nhất: tự ẩn tab chưa có hàm, giữ thứ tự cố định."""
+    # Chọn cửa hàng (luôn nằm trên menu)
+    _store_selector(conn, user)
+
+    # Xây danh sách tab hiển thị
+    visible = []
+    for label, fn_name, need in _MENU_ORDER:
+        fn = globals().get(fn_name)
+        if callable(fn) and _has_perm(user, need):
+            visible.append((label, fn_name))
+
+    st.sidebar.markdown("### 📌 Chức năng")
+    labels = [x[0] for x in visible]
+    if not labels:
+        st.warning("Không có chức năng nào khả dụng cho tài khoản này.")
+        return
+
+    choice = st.sidebar.radio(
+        label="",
+        options=labels,
+        index=0,
+        key="__sb_menu__",
+        label_visibility="collapsed",
+    )
+
+    # Gọi đúng handler
+    for label, fn_name in visible:
+        if label == choice:
+            globals()[fn_name](conn, user)
+            break
+
+# ============== ENTRY POINT (gọi luôn) ==============
 if __name__ == "__main__":
-    __router_kho_sx_only()
-    # CHẶN MỌI CODE Ở DƯỚI (nếu còn sót router/menus khác)
-    import streamlit as st as _st_
-    _st_.stop()
+    conn = get_conn()
+    user = require_login(conn)   # hiện form đăng nhập nếu chưa login
+    header_top(conn, user)       # góc phải: avatar, đổi mật khẩu, đăng xuất
+    router(conn, user)
