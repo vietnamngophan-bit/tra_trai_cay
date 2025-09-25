@@ -765,4 +765,26 @@ def page_sanxuat(conn: Connection, user: dict):
             LIMIT 500
         """, {"s": store})
         st.dataframe(df, use_container_width=True, hide_index=True)# Đang dùng email làm khóa chính => truyền val_col="email"
+# =========================
+# ROUTER TẠM — chỉ KHO & SẢN XUẤT
+# (dùng get_conn(), require_login(), header_top() đã có ở P1)
+# =========================
+def router_kho_sx():
+    conn = get_conn()
+    user = require_login(conn)
+    header_top(conn, user)
+
+    st.sidebar.markdown("## 📌 Chức năng")
+    menu = st.sidebar.radio("Đi tới", ["Kho", "Sản xuất"], index=0, key="menu_kho_sx")
+    st.sidebar.divider()
+    st.sidebar.caption("DB: Postgres (Supabase)")
+
+    if menu == "Kho":
+        page_kho(conn, user)
+    else:
+        page_sanxuat(conn, user)
+
+# ----- ENTRY -----
+if __name__ == "__main__":
+    router_kho_sx()
 
