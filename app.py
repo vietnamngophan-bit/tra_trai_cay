@@ -1241,7 +1241,7 @@ def page_ai(conn):
 # ========== ROUTER & MAIN ==========
 def main():
 
-    conn_local = get_conn()
+    conn = get_conn()
     user = require_login()
     choice = sidebar_menu(user)
 
