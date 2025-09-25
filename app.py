@@ -751,6 +751,267 @@ def page_sanxuat(conn: Connection, user: dict):
             LIMIT 500
         """, {"s": store})
         st.dataframe(df, use_container_width=True, hide_index=True)# Đang dùng email làm khóa chính => truyền val_col="email"
+# =========================================================
+# PHẦN 4/5 — BÁO CÁO TÀI CHÍNH & TÀI SẢN CỐ ĐỊNH (TSCD)
+# Postgres only – dùng các bảng: revenue, inventory_ledger, products,
+# assets, assets_txn. Không đụng router ở đây.
+# =========================================================
+
+from datetime import date, datetime, timedelta
+
+# ---------- Helpers riêng cho báo cáo ----------
+def _money(x): 
+    try: return f"{float(x):,.0f}"
+    except: return "0"
+
+def _daterange_default():
+    today = date.today()
+    fr = today.replace(day=1)
+    to = today
+    return fr, to
+
+def _stock_snapshot(conn, store: str, to_dt: date | None):
+    """
+    Tính tồn & giá trị theo phương pháp bình quân sau mỗi lần nhập.
+    Trả về DF: pcode, qty, avg_cost, value.
+    """
+    # lấy sổ kho tới ngày
+    sql = """
+        SELECT l.store, l.pcode, l.kind, l.qty, COALESCE(l.price_in,0) price_in, l.ts
+        FROM inventory_ledger l
+        WHERE l.store=:s AND l.ts <= (:to::timestamp)
+        ORDER BY l.pcode, l.ts
+    """
+    to_ts = (to_dt or date.today()).strftime("%Y-%m-%d") + " 23:59:59"
+    df = fetch_df(conn, sql, {"s": store, "to": to_ts})
+    if df.empty:
+        return pd.DataFrame(columns=["pcode","qty","avg_cost","value"])
+    out = []
+    for pcode, grp in df.groupby("pcode"):
+        stock = 0.0
+        cost  = 0.0
+        for _, r in grp.sort_values("ts").iterrows():
+            if r["kind"] == "IN":
+                q = float(r["qty"] or 0.0)
+                p = float(r["price_in"] or 0.0)
+                if q > 0:
+                    total = stock*cost + q*p
+                    stock += q
+                    cost = total/stock if stock>0 else 0.0
+            else:  # OUT
+                stock -= float(r["qty"] or 0.0)
+                if stock < 0: stock = 0.0
+        out.append({"pcode": pcode, "qty": stock, "avg_cost": cost, "value": stock*cost})
+    return pd.DataFrame(out)
+
+def _revenue_sum(conn, store: str, fr: date, to: date):
+    sql = """
+      SELECT pay, SUM(amount) total
+      FROM revenue
+      WHERE store=:s AND ts::date BETWEEN :fr AND :to
+      GROUP BY pay
+    """
+    df = fetch_df(conn, sql, {"s": store, "fr": fr, "to": to})
+    cash = float(df.loc[df["pay"]=="CASH","total"].sum() or 0)
+    bank = float(df.loc[df["pay"]=="BANK","total"].sum() or 0)
+    return cash, bank, cash+bank
+
+# ---------- BÁO CÁO TÀI CHÍNH ----------
+def page_baocao(conn, user):
+    st.title("📑 Báo cáo tài chính")
+
+    # chọn cửa hàng (đã có combobox ở sidebar nếu bạn đã làm; ở đây an toàn thêm fallback)
+    store = st.session_state.get("store") or st.selectbox("Cửa hàng", 
+        fetch_df(conn,"SELECT code FROM stores ORDER BY code")["code"].tolist())
+
+    with st.expander("⏱ Thời gian", expanded=True):
+        fr, to = _daterange_default()
+        c1, c2 = st.columns(2)
+        fr = c1.date_input("Từ ngày", fr, key="bc_fr")
+        to = c2.date_input("Đến ngày", to, key="bc_to")
+
+    tabs = st.tabs(["Tổng quan", "Sổ quỹ (CASH/BANK)", "Cân đối kế toán", "Lưu chuyển tiền tệ"])
+    # --- Tổng quan ---
+    with tabs[0]:
+        cash, bank, total = _revenue_sum(conn, store, fr, to)
+        snap = _stock_snapshot(conn, store, to)
+        inventory_value = float(snap["value"].sum() if not snap.empty else 0)
+
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Thu CASH", _money(cash))
+        c2.metric("Thu BANK", _money(bank))
+        c3.metric("Tổng thu", _money(total))
+
+        c4,c5 = st.columns(2)
+        c4.metric("Giá trị tồn kho", _money(inventory_value))
+        # lợi nhuận sơ bộ (chỉ minh họa nếu có bảng cost_of_goods)
+        # Ở đây để 0 cho an toàn:
+        c5.metric("Lợi nhuận ước tính", _money(total - 0))
+
+        st.divider()
+        st.markdown("**Top tồn kho theo giá trị**")
+        if not snap.empty:
+            df_top = snap.sort_values("value", ascending=False).head(20)
+            names = fetch_df(conn, "SELECT code,name FROM products")
+            df_top = df_top.merge(names, left_on="pcode", right_on="code", how="left")
+            st.dataframe(
+                df_top[["pcode","name","qty","avg_cost","value"]]
+                .rename(columns={"pcode":"Mã","name":"Tên","qty":"Tồn","avg_cost":"Giá vốn","value":"Giá trị"}),
+                use_container_width=True, height=420)
+
+    # --- Sổ quỹ ---
+    with tabs[1]:
+        sql = """
+          SELECT ts::timestamp, pay, amount, note, actor
+          FROM revenue
+          WHERE store=:s AND ts::date BETWEEN :fr AND :to
+          ORDER BY ts DESC
+        """
+        df = fetch_df(conn, sql, {"s":store,"fr":fr,"to":to})
+        st.dataframe(df, use_container_width=True, height=480)
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Tổng CASH", _money(df.loc[df["pay"]=="CASH","amount"].sum() if not df.empty else 0))
+        c2.metric("Tổng BANK", _money(df.loc[df["pay"]=="BANK","amount"].sum() if not df.empty else 0))
+        c3.metric("Tổng thu",   _money(df["amount"].sum() if not df.empty else 0))
+
+    # --- Cân đối kế toán (rút gọn) ---
+    with tabs[2]:
+        # Tài sản = Tiền (CASH + BANK) + Giá trị tồn kho
+        cash, bank, total_rev = _revenue_sum(conn, store, fr, to)
+        inv_value = float(_stock_snapshot(conn, store, to)["value"].sum() or 0)
+        # Nợ phải trả & Vốn: demo tối giản (0 và phần bù)
+        tai_san = cash + bank + inv_value
+        no_phai_tra = 0.0
+        von_chu_so_huu = tai_san - no_phai_tra
+
+        df_bs = pd.DataFrame([
+            ["Tài sản ngắn hạn", "", ""],
+            ["  Tiền mặt", _money(cash), ""],
+            ["  Tiền gửi ngân hàng", _money(bank), ""],
+            ["  Hàng tồn kho", _money(inv_value), ""],
+            ["TỔNG TÀI SẢN", _money(tai_san), ""],
+            ["Nợ phải trả", "", ""],
+            ["  Nợ ngắn hạn", _money(no_phai_tra), ""],
+            ["Vốn chủ sở hữu", "", ""],
+            ["  Vốn & LN giữ lại", _money(von_chu_so_huu), ""],
+            ["TỔNG NGUỒN VỐN", _money(no_phai_tra + von_chu_so_huu), ""],
+        ], columns=["Chỉ tiêu","Số tiền","Ghi chú"])
+        st.dataframe(df_bs, use_container_width=True, height=420)
+
+    # --- Lưu chuyển tiền tệ (rút gọn từ bảng revenue) ---
+    with tabs[3]:
+        sql = """
+          SELECT date_trunc('day', ts) d, pay, SUM(amount) amt
+          FROM revenue
+          WHERE store=:s AND ts::date BETWEEN :fr AND :to
+          GROUP BY d, pay ORDER BY d
+        """
+        df = fetch_df(conn, sql, {"s":store,"fr":fr,"to":to})
+        if df.empty:
+            st.info("Chưa có phát sinh.")
+        else:
+            piv = df.pivot_table(index="d", columns="pay", values="amt", aggfunc="sum").fillna(0.0)
+            piv["NET"] = piv.sum(axis=1)
+            st.line_chart(piv[["CASH","BANK","NET"]] if set(["CASH","BANK"]).issubset(piv.columns)
+                          else piv)
+
+# ---------- TÀI SẢN CỐ ĐỊNH ----------
+def _depr_straight_line(cost, salvage, life_months, start_date: date, end_date: date):
+    """Trả về list (kỳ, số khấu hao) theo SL."""
+    if life_months <= 0: return []
+    monthly = max((cost - salvage)/life_months, 0)
+    sched = []
+    cur = date(start_date.year, start_date.month, 1)
+    stop = date(end_date.year, end_date.month, 1)
+    n = 0
+    while cur <= stop and n < life_months:
+        sched.append((cur, monthly))
+        # next month
+        if cur.month == 12:
+            cur = date(cur.year+1, 1, 1)
+        else:
+            cur = date(cur.year, cur.month+1, 1)
+        n += 1
+    return sched
+
+def page_tscd(conn, user):
+    st.title("🏭 Tài sản cố định")
+
+    tabs = st.tabs(["Danh mục TSCD", "Tính khấu hao"])
+    # --- CRUD TSCD ---
+    with tabs[0]:
+        df = fetch_df(conn, """
+            SELECT asset_code, name, start_date::date, cost, salvage, life_months, method, location, active
+            FROM assets ORDER BY asset_code
+        """)
+        st.dataframe(df, use_container_width=True, height=360)
+
+        st.markdown("#### Thêm/Sửa")
+        c1,c2,c3 = st.columns([1,2,1])
+        with c1:
+            asset_code = st.text_input("Mã TS", key="fa_code")
+            cost = st.number_input("Nguyên giá", 0.0, step=100000.0, key="fa_cost")
+            salvage = st.number_input("Giá trị còn lại (salvage)", 0.0, step=100000.0, key="fa_salv")
+            life = st.number_input("Thời gian KH (tháng)", 0, step=1, key="fa_life")
+        with c2:
+            name = st.text_input("Tên tài sản", key="fa_name")
+            start = st.date_input("Ngày bắt đầu KH", value=date.today(), key="fa_start")
+            method = st.selectbox("Phương pháp", ["SL"], index=0, key="fa_method")
+            location = st.text_input("Vị trí/Đơn vị sử dụng", key="fa_loc")
+        with c3:
+            active = st.checkbox("Đang sử dụng", value=True, key="fa_active")
+            if st.button("💾 Lưu/Update", type="primary"):
+                run_sql(conn, """
+                    INSERT INTO assets(asset_code,name,start_date,cost,salvage,life_months,method,location,active)
+                    VALUES(:c,:n,:sd,:cost,:salv,:life,:m,:loc,:act)
+                    ON CONFLICT (asset_code) DO UPDATE
+                    SET name=EXCLUDED.name, start_date=EXCLUDED.start_date, cost=EXCLUDED.cost,
+                        salvage=EXCLUDED.salvage, life_months=EXCLUDED.life_months,
+                        method=EXCLUDED.method, location=EXCLUDED.location, active=EXCLUDED.active
+                """, {"c":asset_code,"n":name,"sd":start,"cost":cost,"salv":salvage,
+                      "life":life,"m":method,"loc":location,"act":active})
+                write_audit(conn,"ASSET_UPSERT",asset_code)
+                st.success("Đã lưu TSCD.")
+                st.rerun()
+            if st.button("🗑️ Xóa"):
+                run_sql(conn, "DELETE FROM assets WHERE asset_code=:c", {"c":asset_code})
+                write_audit(conn,"ASSET_DELETE",asset_code)
+                st.success("Đã xóa.")
+                st.rerun()
+
+    # --- Tính khấu hao ---
+    with tabs[1]:
+        df = fetch_df(conn, "SELECT asset_code,name,start_date::date,cost,salvage,life_months,method FROM assets WHERE active=true ORDER BY asset_code")
+        if df.empty:
+            st.info("Chưa có TSCD.")
+            return
+        pick = st.selectbox("Chọn tài sản", [f"{r.asset_code} — {r.name}" for r in df.itertuples()], index=0)
+        code = pick.split(" — ",1)[0]
+        row = df[df["asset_code"]==code].iloc[0]
+        st.write(f"**Nguyên giá:** {_money(row['cost'])} | **Thời gian KH:** {int(row['life_months'])} tháng | **Bắt đầu:** {row['start_date']}")
+
+        fr, to = _daterange_default()
+        c1,c2 = st.columns(2)
+        fr = c1.date_input("Từ kỳ", fr)
+        to = c2.date_input("Đến kỳ", to)
+
+        sched = _depr_straight_line(
+            float(row["cost"]), float(row["salvage"]), int(row["life_months"]),
+            row["start_date"], to
+        )
+        # lọc theo khoảng
+        sched = [(k, v) for (k, v) in sched if fr.replace(day=1) <= k <= to.replace(day=1)]
+        df_kh = pd.DataFrame(sched, columns=["Kỳ","Khấu hao"]).assign(Kỳ=lambda d: d["Kỳ"].astype(str))
+        st.dataframe(df_kh, use_container_width=True, height=360)
+
+        total_kh = sum(v for _, v in sched)
+        st.metric("Tổng khấu hao kỳ chọn", _money(total_kh))
+
+        if has_perm(user,"REPORT_VIEW") and st.button("📥 Xuất Excel"):
+            out = df_kh.copy()
+            out.to_excel("/tmp/khauhao.xlsx", index=False)
+            with open("/tmp/khauhao.xlsx","rb") as f:
+                st.download_button("Tải file 'khauhao.xlsx'", f, file_name="khauhao.xlsx")
 
 # ========= ROUTER CỐ ĐỊNH (dùng cho toàn bộ app) =========
 
