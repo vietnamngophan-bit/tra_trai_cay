@@ -104,16 +104,17 @@ def _sa_exec_auto(self, statement, *multiparams, **kwargs):
     return _ORIG_SA_EXEC(self, statement, *multiparams, **kwargs)
 _SAConnection.execute = _sa_exec_auto
 
-def run_sql(conn, sql: str, params=None):
-    """Thực thi SQL write (INSERT/UPDATE/DELETE). Tự lo chuyển tham số cho PG."""
+def run_sql(conn, sql, params=None):
+    """Execute a SQL string on both PG/SQLite. With PG we pass dict params."""
     if _IS_PG and isinstance(params, (list, tuple)):
         sql, params = _qmark_to_named(sql, params)
-    res = conn.execute(text(sql) if _IS_PG else sql, params or ())
+    res = conn.execute(text(sql) if _IS_PG else sql, params or {})
     try:
         conn.commit()
-    except Exception:
+    except:
         pass
     return res
+
 
 def fetch_df(conn, sql: str, params=None) -> pd.DataFrame:
     """Đọc DataFrame. Dùng chung cho PG & SQLite."""
