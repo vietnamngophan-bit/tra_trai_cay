@@ -1,8 +1,7 @@
 # ============================================================
-# app.py — Phần 1/4: Cấu hình, DB, Auth, Header, Audit
+# app.py — Phần 1+2: Hạ tầng + CRUD Danh mục, Sản phẩm, Cửa hàng, Người dùng
 # ============================================================
-import os, re, json, hashlib
-from datetime import date, datetime, timedelta
+import os, re, hashlib
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
@@ -57,6 +56,11 @@ def fetch_df(conn: Connection, sql: str, params=None) -> pd.DataFrame:
 
 # ------------------- AUTH -------------------
 def sha256(s: str) -> str: return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def has_perm(user: dict, perm: str) -> bool:
+    if not user: return False
+    if user.get("role")=="SuperAdmin": return True
+    return perm in (user.get("perms") or "").split(",")
 
 def write_audit(conn: Connection, action: str, detail: str = ""):
     try:
@@ -128,29 +132,10 @@ def header_top(conn: Connection, user: dict):
             if st.button("Đăng xuất", use_container_width=True):
                 logout(conn)
 
-# ------------------- MAIN FRAME -------------------
-def main_frame():
-    conn = get_conn()
-    user = require_login(conn)
-    header_top(conn, user)
-
-    # Chỉ hiện Nhật ký (nếu có quyền), KHÔNG gọi trang khác
-    if user.get("role")=="SuperAdmin" or "AUDIT_VIEW" in (user.get("perms") or ""):
-        st.markdown("### 🗒️ Nhật ký")
-        df = fetch_df(conn,"SELECT ts,actor,action,detail FROM syslog ORDER BY ts DESC LIMIT 200")
-        st.dataframe(df, use_container_width=True)
-
-# ------------------- ENTRY -------------------
-if __name__=="__main__":
-    main_frame()
-# ============================================================
-# app.py — Phần 2/4: Dashboard + Danh mục + Cửa hàng + Người dùng
-# ============================================================
-
 # ------------------- DASHBOARD -------------------
 def page_dashboard(conn, user):
-    st.markdown("### 📊 Dashboard")
-    col1, col2, col3 = st.columns(3)
+    st.subheader("📊 Dashboard")
+    col1,col2,col3 = st.columns(3)
     with col1:
         df = fetch_df(conn,"SELECT COUNT(*) AS n FROM products")
         st.metric("Sản phẩm", int(df.iloc[0]["n"]))
@@ -162,133 +147,140 @@ def page_dashboard(conn, user):
         st.metric("Người dùng", int(df.iloc[0]["n"]))
 
 # ------------------- DANH MỤC -------------------
-def page_danhmuc(conn, user):
-    st.markdown("### 📂 Danh mục sản phẩm")
+def page_danhmuc(conn,user):
+    st.subheader("📂 Quản lý Danh mục")
+    if not has_perm(user,"CAT_EDIT"):
+        st.warning("Không có quyền."); return
     df = fetch_df(conn,"SELECT code,name FROM categories ORDER BY code")
-    st.dataframe(df, use_container_width=True)
-    mode = st.radio("Chế độ", ["Tạo mới","Sửa/Xóa"], horizontal=True)
+    st.dataframe(df,use_container_width=True)
+    with st.form("form_cat", clear_on_submit=True):
+        code = st.text_input("Mã DM").upper()
+        name = st.text_input("Tên DM")
+        act  = st.radio("Hành động",["Thêm","Sửa","Xóa"])
+        ok = st.form_submit_button("Thực hiện")
+    if ok and code:
+        if act=="Thêm":
+            run_sql(conn,"INSERT INTO categories(code,name) VALUES(:c,:n) "
+                         "ON CONFLICT(code) DO UPDATE SET name=:n",{"c":code,"n":name})
+        elif act=="Sửa":
+            run_sql(conn,"UPDATE categories SET name=:n WHERE code=:c",{"c":code,"n":name})
+        elif act=="Xóa":
+            run_sql(conn,"DELETE FROM categories WHERE code=:c",{"c":code})
+        st.rerun()
 
-    if mode=="Tạo mới":
-        code = st.text_input("Mã DM")
-        name = st.text_input("Tên danh mục")
-        if st.button("💾 Lưu"):
-            if code and name:
-                run_sql(conn,"INSERT INTO categories(code,name) VALUES(:c,:n) ON CONFLICT(code) DO UPDATE SET name=:n",
-                        {"c":code,"n":name})
-                st.success("Đã lưu danh mục")
-                st.rerun()
-    else:
-        if df.empty:
-            st.info("Chưa có danh mục.")
-            return
-        sel = st.selectbox("Chọn", df["code"])
-        row = df[df["code"]==sel].iloc[0]
-        name = st.text_input("Tên danh mục", row["name"])
-        c1,c2 = st.columns(2)
-        with c1:
-            if st.button("💾 Cập nhật"):
-                run_sql(conn,"UPDATE categories SET name=:n WHERE code=:c",{"n":name,"c":sel})
-                st.success("Đã cập nhật"); st.rerun()
-        with c2:
-            if st.button("🗑️ Xóa"):
-                run_sql(conn,"DELETE FROM categories WHERE code=:c",{"c":sel})
-                st.success("Đã xóa"); st.rerun()
+# ------------------- SẢN PHẨM -------------------
+def page_sanpham(conn,user):
+    st.subheader("📦 Quản lý Sản phẩm")
+    if not has_perm(user,"PROD_EDIT"):
+        st.warning("Không có quyền."); return
+    df = fetch_df(conn,"SELECT code,name,cat_code,uom,cups_per_kg,price_ref FROM products ORDER BY code")
+    st.dataframe(df,use_container_width=True)
+    with st.form("form_prod", clear_on_submit=True):
+        code = st.text_input("Mã SP").upper()
+        name = st.text_input("Tên SP")
+        cat  = st.text_input("Danh mục").upper()
+        uom  = st.text_input("ĐVT")
+        cups = st.number_input("Số cốc/kg",0.0,100.0,0.0,1.0)
+        price= st.number_input("Giá tham chiếu",0.0,1e9,0.0,1000.0)
+        act  = st.radio("Hành động",["Thêm","Sửa","Xóa"])
+        ok = st.form_submit_button("Thực hiện")
+    if ok and code:
+        if act=="Thêm":
+            run_sql(conn,"INSERT INTO products(code,name,cat_code,uom,cups_per_kg,price_ref) "
+                         "VALUES(:c,:n,:cat,:u,:cups,:p) "
+                         "ON CONFLICT(code) DO UPDATE SET name=:n,cat_code=:cat,uom=:u,cups_per_kg=:cups,price_ref=:p",
+                         {"c":code,"n":name,"cat":cat,"u":uom,"cups":cups,"p":price})
+        elif act=="Sửa":
+            run_sql(conn,"UPDATE products SET name=:n,cat_code=:cat,uom=:u,cups_per_kg=:cups,price_ref=:p WHERE code=:c",
+                    {"c":code,"n":name,"cat":cat,"u":uom,"cups":cups,"p":price})
+        elif act=="Xóa":
+            run_sql(conn,"DELETE FROM products WHERE code=:c",{"c":code})
+        st.rerun()
 
 # ------------------- CỬA HÀNG -------------------
-def page_cuahang(conn, user):
-    st.markdown("### 🏬 Quản lý cửa hàng")
+def page_cuahang(conn,user):
+    st.subheader("🏬 Quản lý Cửa hàng")
+    if not has_perm(user,"STORE_EDIT"):
+        st.warning("Không có quyền."); return
     df = fetch_df(conn,"SELECT code,name,addr,note FROM stores ORDER BY code")
     st.dataframe(df,use_container_width=True)
-    mode = st.radio("Chế độ",["Tạo mới","Sửa/Xóa"],horizontal=True)
-
-    if mode=="Tạo mới":
-        code = st.text_input("Mã cửa hàng")
-        name = st.text_input("Tên cửa hàng")
-        addr = st.text_input("Địa chỉ")
-        note = st.text_area("Ghi chú")
-        if st.button("💾 Lưu"):
-            run_sql(conn,"INSERT INTO stores(code,name,addr,note) VALUES(:c,:n,:a,:t) ON CONFLICT(code) DO UPDATE SET name=:n,addr=:a,note=:t",
+    with st.form("form_store", clear_on_submit=True):
+        code= st.text_input("Mã cửa hàng").upper()
+        name= st.text_input("Tên cửa hàng")
+        addr= st.text_input("Địa chỉ")
+        note= st.text_area("Ghi chú")
+        act = st.radio("Hành động",["Thêm","Sửa","Xóa"])
+        ok= st.form_submit_button("Thực hiện")
+    if ok and code:
+        if act=="Thêm":
+            run_sql(conn,"INSERT INTO stores(code,name,addr,note) VALUES(:c,:n,:a,:t) "
+                         "ON CONFLICT(code) DO UPDATE SET name=:n,addr=:a,note=:t",
+                         {"c":code,"n":name,"a":addr,"t":note})
+        elif act=="Sửa":
+            run_sql(conn,"UPDATE stores SET name=:n,addr=:a,note=:t WHERE code=:c",
                     {"c":code,"n":name,"a":addr,"t":note})
-            st.success("Đã lưu"); st.rerun()
-    else:
-        if df.empty:
-            st.info("Chưa có cửa hàng."); return
-        sel = st.selectbox("Chọn", df["code"])
-        row = df[df["code"]==sel].iloc[0]
-        name = st.text_input("Tên", row["name"])
-        addr = st.text_input("Địa chỉ", row["addr"] or "")
-        note = st.text_area("Ghi chú", row["note"] or "")
-        c1,c2 = st.columns(2)
-        with c1:
-            if st.button("💾 Cập nhật"):
-                run_sql(conn,"UPDATE stores SET name=:n,addr=:a,note=:t WHERE code=:c",
-                        {"n":name,"a":addr,"t":note,"c":sel})
-                st.success("Đã cập nhật"); st.rerun()
-        with c2:
-            if st.button("🗑️ Xóa"):
-                run_sql(conn,"DELETE FROM stores WHERE code=:c",{"c":sel})
-                st.success("Đã xóa"); st.rerun()
+        elif act=="Xóa":
+            run_sql(conn,"DELETE FROM stores WHERE code=:c",{"c":code})
+        st.rerun()
 
 # ------------------- NGƯỜI DÙNG -------------------
-def page_nguoidung(conn, user):
-    st.markdown("### 👥 Quản lý người dùng")
-    df = fetch_df(conn,"SELECT email,display,role,store_code FROM users ORDER BY email")
+def page_nguoidung(conn,user):
+    st.subheader("👥 Quản lý Người dùng")
+    if not has_perm(user,"USER_EDIT"):
+        st.warning("Không có quyền."); return
+    df = fetch_df(conn,"SELECT email,display,role,store_code,perms FROM users ORDER BY email")
     st.dataframe(df,use_container_width=True)
-    mode = st.radio("Chế độ",["Tạo mới","Sửa/Xóa"],horizontal=True)
+    with st.form("form_user", clear_on_submit=True):
+        email= st.text_input("Email").lower()
+        display= st.text_input("Tên hiển thị")
+        pw= st.text_input("Mật khẩu (bỏ trống nếu không đổi)", type="password")
+        role= st.selectbox("Vai trò",["User","Admin","SuperAdmin"])
+        store= st.text_input("Mã cửa hàng").upper()
+        perms= st.text_area("Quyền (phân cách bằng dấu phẩy)")
+        act= st.radio("Hành động",["Thêm","Sửa","Xóa"])
+        ok= st.form_submit_button("Thực hiện")
+    if ok and email:
+        if act=="Thêm":
+            run_sql(conn,"INSERT INTO users(email,display,password,role,store_code,perms) "
+                         "VALUES(:e,:d,:p,:r,:s,:m)",
+                         {"e":email,"d":display,"p":sha256(pw) if pw else "","r":role,"s":store,"m":perms})
+        elif act=="Sửa":
+            if pw:
+                run_sql(conn,"UPDATE users SET display=:d,password=:p,role=:r,store_code=:s,perms=:m WHERE email=:e",
+                        {"d":display,"p":sha256(pw),"r":role,"s":store,"m":perms,"e":email})
+            else:
+                run_sql(conn,"UPDATE users SET display=:d,role=:r,store_code=:s,perms=:m WHERE email=:e",
+                        {"d":display,"r":role,"s":store,"m":perms,"e":email})
+        elif act=="Xóa":
+            run_sql(conn,"DELETE FROM users WHERE email=:e",{"e":email})
+        st.rerun()
 
-    if mode=="Tạo mới":
-        email = st.text_input("Email")
-        display = st.text_input("Tên hiển thị")
-        pw = st.text_input("Mật khẩu", type="password")
-        role = st.selectbox("Vai trò",["User","Admin","SuperAdmin"])
-        store = st.text_input("Mã cửa hàng (bỏ trống nếu SuperAdmin)")
-        if st.button("💾 Lưu"):
-            if email and pw:
-                run_sql(conn,"INSERT INTO users(email,display,password,role,store_code) VALUES(:e,:d,:p,:r,:s) ON CONFLICT(email) DO UPDATE SET display=:d,role=:r,store_code=:s",
-                        {"e":email,"d":display,"p":sha256(pw),"r":role,"s":(store if role!="SuperAdmin" else None)})
-                st.success("Đã lưu user"); st.rerun()
-    else:
-        if df.empty:
-            st.info("Chưa có user."); return
-        sel = st.selectbox("Chọn user", df["email"])
-        row = df[df["email"]==sel].iloc[0]
-        display = st.text_input("Tên hiển thị", row["display"] or "")
-        role = st.selectbox("Vai trò",["User","Admin","SuperAdmin"], index=["User","Admin","SuperAdmin"].index(row["role"]))
-        store = st.text_input("Mã cửa hàng", row["store_code"] or "")
-        newpw = st.text_input("Mật khẩu mới (nếu đổi)", type="password")
-        c1,c2 = st.columns(2)
-        with c1:
-            if st.button("💾 Cập nhật"):
-                if newpw:
-                    run_sql(conn,"UPDATE users SET display=:d,role=:r,store_code=:s,password=:p WHERE email=:e",
-                            {"d":display,"r":role,"s":(store if role!="SuperAdmin" else None),"p":sha256(newpw),"e":sel})
-                else:
-                    run_sql(conn,"UPDATE users SET display=:d,role=:r,store_code=:s WHERE email=:e",
-                            {"d":display,"r":role,"s":(store if role!="SuperAdmin" else None),"e":sel})
-                st.success("Đã cập nhật"); st.rerun()
-        with c2:
-            if st.button("🗑️ Xóa"):
-                run_sql(conn,"DELETE FROM users WHERE email=:e",{"e":sel})
-                st.success("Đã xóa"); st.rerun()
-
-# ------------------- CẬP NHẬT MAIN FRAME -------------------
-def main_frame():
+# ------------------- ROUTER -------------------
+def router():
     conn = get_conn()
     user = require_login(conn)
-    header_top(conn, user)
+    header_top(conn,user)
 
     menu = st.sidebar.radio("Chọn chức năng",
-        ["Dashboard","Danh mục","Cửa hàng","Người dùng","Nhật ký"],
-        index=0)
-    st.sidebar.caption("DB: Postgres (Supabase)")
+        ["Dashboard","Danh mục","Sản phẩm","Cửa hàng","Người dùng","Nhật ký"], index=0)
 
-    if menu=="Dashboard": page_dashboard(conn,user)
-    elif menu=="Danh mục": page_danhmuc(conn,user)
-    elif menu=="Cửa hàng": page_cuahang(conn,user)
-    elif menu=="Người dùng": page_nguoidung(conn,user)
+    if menu=="Dashboard":
+        page_dashboard(conn,user)
+    elif menu=="Danh mục":
+        page_danhmuc(conn,user)
+    elif menu=="Sản phẩm":
+        page_sanpham(conn,user)
+    elif menu=="Cửa hàng":
+        page_cuahang(conn,user)
+    elif menu=="Người dùng":
+        page_nguoidung(conn,user)
     elif menu=="Nhật ký":
         if has_perm(user,"AUDIT_VIEW") or user.get("role")=="SuperAdmin":
             df = fetch_df(conn,"SELECT ts,actor,action,detail FROM syslog ORDER BY ts DESC LIMIT 200")
             st.dataframe(df,use_container_width=True)
         else:
             st.warning("Không có quyền xem nhật ký.")
+
+# ------------------- ENTRY -------------------
+if __name__=="__main__":
+    router()
