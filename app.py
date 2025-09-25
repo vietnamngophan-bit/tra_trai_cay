@@ -315,7 +315,7 @@ def page_users(conn: Connection, user: dict):
         write_audit(conn,"USER_UPSERT",email); st.success("Đã lưu."); st.rerun()
 
     st.markdown("#### Sửa/Xóa/Đổi mật khẩu")
-    pick = _select_row(df.assign(show=lambda d:d["display"]), "Chọn người dùng", "u_pick")
+    pick = _select_row(df, "Chọn người dùng", "u_pick", show_col="display", val_col="email")
     if pick:
         row = fetch_df(conn,"SELECT * FROM users WHERE email=:e",{"e":pick}).iloc[0]
         colA,colB = st.columns(2)
