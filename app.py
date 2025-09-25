@@ -24,86 +24,105 @@ import numpy as np
 # DB BRIDGE (SQLite local <-> Supabase/Postgres online)
 # ====================================================
 
+# ==========================
+# Postgres-only (Supabase) DB layer
+# ==========================
 _ENGINE = None
-_IS_PG = False
 
-from urllib.parse import quote_plus, urlparse, urlunparse, parse_qsl, urlencode
-
-def _normalize_pg_url(url: str) -> str:
-    # 1) chuẩn driver
+# --- ép dùng pooler + ssl, và chuẩn hoá scheme ---
+def _force_pooler(url: str) -> str:
+    """
+    Chuẩn hoá postgres URL cho SQLAlchemy + chuyển host sang Session Pooler của Supabase
+    và thêm sslmode=require.
+    - Hỗ trợ đầu vào: postgres://..., postgresql://..., postgresql+psycopg2://...
+    - Trả về: postgresql+psycopg2://user:pass@aws-1-ap-southeast-1.pooler.supabase.com:6543/db?sslmode=require
+    """
+    # 1) scheme → SQLAlchemy
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg2://", 1)
     elif url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
 
-    # 2) encode lại password nếu có ký tự đặc biệt
-    u = urlparse(url)
-    if u.password is not None:
-        pwd_enc = quote_plus(u.password)
-        netloc = f"{u.username}:{pwd_enc}@{u.hostname}"
-        if u.port:
-            netloc += f":{u.port}"
-        url = urlunparse((u.scheme, netloc, u.path, u.params, u.query, u.fragment))
-        u = urlparse(url)
+    try:
+        from urllib.parse import urlparse, urlunparse, quote_plus
+        p = urlparse(url)
 
-    # 3) bắt buộc sslmode=require
-    q = dict(parse_qsl(u.query)) if u.query else {}
-    if "sslmode" not in q:
-        q["sslmode"] = "require"
-    url = urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
-    return url
+        # 2) nếu là host *.supabase.co → ép sang pooler
+        host = (p.hostname or "").lower()
+        if host.endswith(".supabase.co"):
+            pooler = "aws-1-ap-southeast-1.pooler.supabase.com"
+            user = p.username or ""
+            pw = quote_plus(p.password) if p.password else None
+            creds = user if user else ""
+            if pw is not None:
+                creds += f":{pw}"
+            if creds:
+                creds += "@"
+            netloc = f"{creds}{pooler}:6543"
+            p = p._replace(netloc=netloc)
+
+        # 3) chắc chắn có sslmode=require
+        q = p.query or ""
+        if "sslmode=" not in q:
+            q = (q + "&" if q else "") + "sslmode=require"
+        p = p._replace(query=q)
+
+        return urlunparse(p)
+    except Exception:
+        # Nếu có lỗi parse vẫn trả về url cũ (đã chuẩn hoá scheme ở trên)
+        return url
 
 def get_conn():
-    global _ENGINE, _IS_PG
+    """
+    Luôn trả về kết nối Postgres (SQLAlchemy connection).
+    YÊU CẦU: đặt DATABASE_URL trong Streamlit Secrets/ENV.
+    Gợi ý value (dùng trực tiếp URI Pooler của Supabase):
+      postgresql://postgres:<PASSWORD>@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres?sslmode=require
+    Hoặc dán URI primary, hàm này sẽ tự ép sang pooler.
+    """
+    global _ENGINE
     url = os.getenv("DATABASE_URL", "").strip()
-    if url:
-        _IS_PG = True
-        url = _normalize_pg_url(url)
-        if _ENGINE is None:
-            _ENGINE = create_engine(url, pool_pre_ping=True, future=True)
-        return _ENGINE.connect()
-    else:
-        import sqlite3
-        os.makedirs("data", exist_ok=True)
-        return sqlite3.connect(os.path.join("data","app.db"), check_same_thread=False)
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set. Add it in Streamlit Secrets.")
 
+    url = _force_pooler(url)
+    if _ENGINE is None:
+        _ENGINE = create_engine(url, pool_pre_ping=True, future=True)
+    return _ENGINE.connect()
+
+# --- hỗ trợ chuyển dấu hỏi (?) → tham số đặt tên (:p1, :p2, ...) khi chạy trên Postgres ---
 def _qmark_to_named(sql: str, params):
     if not isinstance(params, (list, tuple)):
         return sql, (params or {})
     idx = 1
     def repl(_):
         nonlocal idx
-        s = f":p{idx}"; idx += 1; return s
+        s = f":p{idx}"
+        idx += 1
+        return s
     sql2 = re.sub(r"\?", repl, sql)
     params2 = {f"p{i+1}": v for i, v in enumerate(params)}
     return sql2, params2
 
-# Patch pandas.read_sql_query để chạy cả PG/SQLite
+# --- vá pandas.read_sql_query để chấp nhận chuỗi + params list/tuple khi dùng Postgres ---
 _ORIG_PD_READ = pd.read_sql_query
 def _pd_read_sql_query_any(sql, conn, params=None, *args, **kwargs):
-    if _IS_PG:
+    # conn là SQLAlchemy Connection (Postgres)
+    if isinstance(sql, str):
         if isinstance(params, (list, tuple)):
             sql, params = _qmark_to_named(sql, params)
         return _ORIG_PD_READ(text(sql), conn, params=params or {}, *args, **kwargs)
-    else:
-        return _ORIG_PD_READ(sql, conn, params=params, *args, **kwargs)
+    # fallback (không nên chạy tới nhánh này với Postgres)
+    return _ORIG_PD_READ(sql, conn, params=params, *args, **kwargs)
 pd.read_sql_query = _pd_read_sql_query_any
 
-#test loi
-import streamlit as st
-st.caption("DB: " + ("Postgres" if os.getenv("DATABASE_URL") else "SQLite"))
-try:
-    conn.execute(text("select 1"))
-    st.success("Kết nối DB OK")
-except Exception as e:
-    st.error(f"Lỗi kết nối DB: {e}")
-
-# ---- Patch SQLAlchemy Connection.execute để giả lập "INSERT OR REPLACE" ----
+# --- vá Connection.execute để nhận chuỗi SQL + auto chuyển ? →
 _ORIG_SA_EXEC = _SAConnection.execute
 def _sa_exec_auto(self, statement, *multiparams, **kwargs):
     if isinstance(statement, str):
-        if _IS_PG and "INSERT OR REPLACE" in statement.upper():
-            # chuyển sang UPSERT ON CONFLICT
+        # Chuyển "INSERT OR REPLACE" (SQLite style) → UPSERT trên PG nếu bạn còn dùng ở đâu đó
+        up = statement.upper()
+        if "INSERT OR REPLACE" in up:
             stmt = statement.replace("INSERT OR REPLACE", "INSERT")
             m = re.search(r"INSERT\s+INTO\s+(\w+)", stmt, re.I)
             if m:
@@ -112,30 +131,28 @@ def _sa_exec_auto(self, statement, *multiparams, **kwargs):
                 cols = re.findall(r"\((.*?)\)", stmt)[0].split(",")
                 sets = [f"{c.strip()}=EXCLUDED.{c.strip()}" for c in cols if c.strip() != conflict]
                 statement = stmt + f" ON CONFLICT ({conflict}) DO UPDATE SET " + ", ".join(sets)
-        if _IS_PG:
-            if multiparams and isinstance(multiparams[0], (list, tuple)):
-                sql, params = _qmark_to_named(statement, multiparams[0])
-                return _ORIG_SA_EXEC(self, text(sql), params)
-            return _ORIG_SA_EXEC(self, text(statement), **kwargs)
-        else:
-            try:
-                return self.exec_driver_sql(statement, *multiparams, **kwargs)
-            except Exception:
-                return _ORIG_SA_EXEC(self, text(statement), **kwargs)
+
+        # Nếu đối số params truyền kiểu positional list/tuple → đổi sang đặt tên
+        if multiparams and isinstance(multiparams[0], (list, tuple)):
+            sql, params = _qmark_to_named(statement, multiparams[0])
+            return _ORIG_SA_EXEC(self, text(sql), params)
+
+        return _ORIG_SA_EXEC(self, text(statement), **kwargs)
     return _ORIG_SA_EXEC(self, statement, *multiparams, **kwargs)
 _SAConnection.execute = _sa_exec_auto
 
-# ---- Helpers chung ----
+# --- helpers ngắn gọn ---
 def run_sql(conn, sql, params=None):
-    if _IS_PG and isinstance(params, (list, tuple)):
+    if isinstance(params, (list, tuple)):
         sql, params = _qmark_to_named(sql, params)
-    res = conn.execute(text(sql) if _IS_PG else sql, params or ())
+    res = conn.execute(text(sql) if isinstance(sql, str) else sql, params or {})
     try: conn.commit()
     except: pass
     return res
 
 def fetch_df(conn, sql, params=None):
-    return pd.read_sql_query(sql, conn, params=params)
+    return pd.read_sql_query(sql, conn, params=params or {})
+
 
 def avg_cost(conn, store, pcode):
     dfc = fetch_df(conn, """
