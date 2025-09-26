@@ -231,7 +231,7 @@ def page_catalog(conn, user):
 
                 # Sản phẩm đầu ra
                 out_df = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code IN ('COT','MUT') ORDER BY name")
-                out_opts = ["— Chọn —"] + [f\"{r['code']} — {r['name']}\" for _,r in out_df.iterrows()]
+                out_opts = ["— Chọn —"] + [f"{r['code']} — {r['name']}" for _,r in out_df.iterrows()]
                 out_pick = st.selectbox("Sản phẩm đầu ra (chỉ chọn SP có loại phù hợp)", out_opts, index=0, key="new_ct_out")
                 output_pcode = "" if out_pick=="— Chọn —" else out_pick.split(" — ",1)[0]
 
