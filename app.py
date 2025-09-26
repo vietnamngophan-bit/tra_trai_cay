@@ -195,22 +195,22 @@ def page_catalog(conn, user):
             run_sql(conn,"DELETE FROM products WHERE code=:c",{"c":pick}); st.rerun()
     # --- formulas (PRO; dùng formulas + formula_inputs) ---
     # --- formulas (PRO; dùng formulas + formula_inputs) ---
-with tabs[2]:
-    st.info(
-        "CỐT = 1 bước (có hệ số thu hồi). "
-        "MỨT = 2 bước (không có hệ số). "
-        "Công thức hỗ trợ nhiều NVL chính + nhiều phụ gia. "
-        "Định lượng nhập theo **kg NVL / 1kg TP**."
-    )
+    with tabs[2]:
+        st.info(
+            "CỐT = 1 bước (có hệ số thu hồi). "
+            "MỨT = 2 bước (không có hệ số). "
+            "Công thức hỗ trợ nhiều NVL chính + nhiều phụ gia. "
+            "Định lượng nhập theo **kg NVL / 1kg TP**."
+        )
 
-    df_hdr = fetch_df(conn, """
-        SELECT code,name,type,output_pcode,output_uom,recovery,cups_per_kg,note
-        FROM formulas
-        ORDER BY type,name
-    """)
-    st.dataframe(df_hdr, use_container_width=True, height=280)
+        df_hdr = fetch_df(conn, """
+            SELECT code,name,type,output_pcode,output_uom,recovery,cups_per_kg,note
+            FROM formulas
+            ORDER BY type,name
+        """)
+        st.dataframe(df_hdr, use_container_width=True, height=280)
 
-    mode = st.radio("Chế độ", ["Tạo mới", "Sửa/Xóa"], horizontal=True)
+        mode = st.radio("Chế độ", ["Tạo mới", "Sửa/Xóa"], horizontal=True)
 
     # ======== TẠO MỚI ========
     if mode == "Tạo mới":
