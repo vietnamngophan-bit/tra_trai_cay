@@ -114,6 +114,11 @@ def page_users(conn, user):
             st.success("Đã xóa."); st.rerun()
 
 # ===================== DANH MỤC / SẢN PHẨM / CÔNG THỨC =====================
+def _ensure_type_state(key="ct_type"):
+    """Giữ state loại công thức để rerun khi đổi lựa chọn."""
+    if key not in st.session_state:
+        st.session_state[key] = "COT"
+
 def page_catalog(conn, user):
     st.header("🧾 Danh mục")
     tabs = st.tabs(["Danh mục SP","Sản phẩm","Công thức"])
@@ -189,7 +194,7 @@ def page_catalog(conn, user):
             "• **CỐT**: có **hệ số thu hồi**; `cups_per_kg` = **cốc/1kg TP**.\n"
             "• **MỨT**: **không** có hệ số thu hồi; `cups_per_kg` = **Gram/cốc (MỨT)**.\n"
             "• NVL chính theo nguồn: **CỐT → Trái cây**; **MỨT → Trái cây/Cốt**.\n"
-            "• Phụ gia: nhóm **PHU_GIA**; định lượng đều là **kg / 1kg TP**."
+            "• Phụ gia thuộc nhóm **PHU_GIA**; định lượng đều là **kg / 1kg TP**."
         )
 
         df_hdr = fetch_df(conn, """
@@ -199,37 +204,41 @@ def page_catalog(conn, user):
         st.dataframe(df_hdr, use_container_width=True, height=280)
 
         # ===== Thêm mới =====
-        with st.expander("➕ Thêm công thức"):
+        with st.expander("➕ Thêm công thức", expanded=False):
+            _ensure_type_state("ct_type_add")
+            # chọn loại và ép rerun khi đổi
+            typ = st.selectbox("Loại", ["COT","MUT"], key="ct_type_add")
+            if "last_ct_type_add" not in st.session_state or st.session_state["last_ct_type_add"] != typ:
+                st.session_state["last_ct_type_add"] = typ
+                st.experimental_rerun()
+
             with st.form("fm_ct_add", clear_on_submit=True):
                 colA, colB = st.columns(2)
                 with colA:
                     code = st.text_input("Mã CT")
                     name = st.text_input("Tên CT")
-                    typ  = st.selectbox("Loại", ["COT","MUT"])
                 with colB:
                     if typ=="COT":
-                        cups_label = "Cốc/kg TP (CỐT)"
-                        cups = st.number_input(cups_label, value=0.0, step=0.1, min_value=0.0)
-                        recovery = st.number_input("Hệ số thu hồi (CỐT)", value=1.0, step=0.01, min_value=0.01)
+                        cups = st.number_input("Cốc/kg TP (CỐT)", value=0.0, step=0.1, min_value=0.0, key="cups_cot_add")
+                        recovery = st.number_input("Hệ số thu hồi (CỐT)", value=1.0, step=0.01, min_value=0.01, key="rec_cot_add")
                     else:
-                        cups_label = "Gram/cốc (MỨT)"
-                        cups = st.number_input(cups_label, value=0.0, step=1.0, min_value=0.0)
+                        cups = st.number_input("Gram/cốc (MỨT)", value=0.0, step=1.0, min_value=0.0, key="cups_mut_add")
                         recovery = 1.0  # ẩn/khóa
 
-                # SP đầu ra theo loại
                 out_cat = "COT" if typ=="COT" else "MUT"
                 df_out = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c":out_cat})
                 out_pick = st.selectbox("Sản phẩm đầu ra",
-                                        [f"{r['code']} — {r['name']}" for _,r in df_out.iterrows()] or ["—"])
+                                        [f"{r['code']} — {r['name']}" for _,r in df_out.iterrows()] or ["—"],
+                                        key="ct_out_add")
                 output_pcode = "" if out_pick=="—" else out_pick.split(" — ",1)[0]
 
-                # Nguồn NVL chính
+                # nguồn NVL chính
                 if typ=="COT":
                     src_kind = "TRAI_CAY"
+                    st.caption("Nguồn NVL chính: Trái cây")
                 else:
-                    src_kind = st.radio("Nguồn NVL (MỨT)", ["TRAI_CAY","COT"], horizontal=True, index=0)
+                    src_kind = st.radio("Nguồn NVL (MỨT)", ["TRAI_CAY","COT"], horizontal=True, index=0, key="mut_src_add")
 
-                # NVL chính theo nguồn
                 df_src = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": src_kind})
                 picked_raw = st.multiselect("Chọn NVL chính",
                                             [f"{r['code']} — {r['name']}" for _, r in df_src.iterrows()],
@@ -240,7 +249,6 @@ def page_catalog(conn, user):
                     q0 = st.number_input(f"{item} — kg / 1kg TP", 0.0, step=0.01, min_value=0.0, key=f"raw_add_{c0}")
                     if q0>0: raw_inputs[c0] = q0
 
-                # Phụ gia
                 df_add = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code='PHU_GIA' ORDER BY name")
                 picked_add = st.multiselect("Chọn phụ gia",
                                             [f"{r['code']} — {r['name']}" for _, r in df_add.iterrows()],
@@ -265,7 +273,6 @@ def page_catalog(conn, user):
                                   recovery=EXCLUDED.recovery, cups_per_kg=EXCLUDED.cups_per_kg, note=EXCLUDED.note
                         """, {"c":code,"n":name,"t":typ,"o":output_pcode,
                               "r": float(recovery), "k": float(cups), "x": note})
-                        # ghi inputs
                         run_sql(conn, "DELETE FROM formula_inputs WHERE formula_code=:c", {"c":code})
                         for k,v in raw_inputs.items():
                             run_sql(conn, """
@@ -281,60 +288,68 @@ def page_catalog(conn, user):
                         st.success("Đã lưu công thức."); st.rerun()
 
         # ===== Sửa / Xóa =====
-        with st.expander("✏️ Sửa / Xóa công thức"):
+        with st.expander("✏️ Sửa / Xóa công thức", expanded=False):
             if df_hdr.empty:
                 st.info("Chưa có công thức.")
             else:
+                _ensure_type_state("ct_type_edit_holder")
                 pick = st.selectbox("Chọn CT", [f"{r['code']} — {r['name']}" for _,r in df_hdr.iterrows()], key="ct_pick_edit")
                 ct_code = pick.split(" — ",1)[0]
                 hdr = fetch_df(conn, "SELECT * FROM formulas WHERE code=:c", {"c": ct_code}).iloc[0].to_dict()
                 det = fetch_df(conn, "SELECT * FROM formula_inputs WHERE formula_code=:c ORDER BY kind", {"c": ct_code})
 
+                # đồng bộ loại hiện tại vào state để auto-rerun khi người dùng đổi
+                default_type = "COT" if hdr["type"]=="COT" else "MUT"
+                if "ct_type_edit" not in st.session_state:
+                    st.session_state["ct_type_edit"] = default_type
+
+                typ = st.selectbox("Loại", ["COT","MUT"], index=(0 if default_type=="COT" else 1), key="ct_type_edit")
+                if "last_ct_type_edit" not in st.session_state or st.session_state["last_ct_type_edit"] != typ:
+                    st.session_state["last_ct_type_edit"] = typ
+                    st.experimental_rerun()
+
                 with st.form("fm_ct_edit", clear_on_submit=True):
                     colA, colB = st.columns(2)
                     with colA:
-                        name = st.text_input("Tên CT", value=hdr["name"] or "")
-                        typ  = st.selectbox("Loại", ["COT","MUT"], index=(0 if hdr["type"]=="COT" else 1))
+                        name = st.text_input("Tên CT", value=hdr["name"] or "", key="ct_name_edit")
                     with colB:
                         if typ=="COT":
-                            cups_label = "Cốc/kg TP (CỐT)"
-                            cups = st.number_input(cups_label, value=float(hdr.get("cups_per_kg") or 0.0),
-                                                   step=0.1, min_value=0.0)
+                            cups = st.number_input("Cốc/kg TP (CỐT)",
+                                                   value=float(hdr.get("cups_per_kg") or 0.0),
+                                                   step=0.1, min_value=0.0, key="cups_cot_edit")
                             recovery = st.number_input("Hệ số thu hồi (CỐT)",
                                                        value=float(hdr.get("recovery") or 1.0),
-                                                       step=0.01, min_value=0.01)
+                                                       step=0.01, min_value=0.01, key="rec_cot_edit")
                         else:
-                            cups_label = "Gram/cốc (MỨT)"
-                            cups = st.number_input(cups_label, value=float(hdr.get("cups_per_kg") or 0.0),
-                                                   step=1.0, min_value=0.0)
-                            recovery = 1.0  # ẩn/khóa
+                            cups = st.number_input("Gram/cốc (MỨT)",
+                                                   value=float(hdr.get("cups_per_kg") or 0.0),
+                                                   step=1.0, min_value=0.0, key="cups_mut_edit")
+                            recovery = 1.0  # ẩn
 
-                    # SP đầu ra
                     out_cat = "COT" if typ=="COT" else "MUT"
                     df_out = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": out_cat})
                     cur_out = hdr["output_pcode"]
                     options = ([f"{cur_out} — (hiện tại)"] +
                                [f"{r['code']} — {r['name']}" for _,r in df_out.iterrows() if r["code"]!=cur_out]) or ["—"]
-                    out_pick = st.selectbox("Sản phẩm đầu ra", options, index=0)
+                    out_pick = st.selectbox("Sản phẩm đầu ra", options, index=0, key="ct_out_edit")
                     output_pcode = cur_out if " (hiện tại)" in out_pick else out_pick.split(" — ",1)[0]
 
-                    # Nguồn NVL
+                    # nguồn NVL
                     if typ=="MUT":
                         src_kind = "TRAI_CAY"
                         if (hdr.get("note") or "").startswith("SRC="):
                             src_kind = (hdr["note"].split("=",1)[1] or "TRAI_CAY")
-                        src_kind = st.radio("Nguồn NVL (MỨT)", ["TRAI_CAY","COT"],
+                        src_kind = st.radio("Nguồn NVL (MỨT)",
+                                            ["TRAI_CAY","COT"],
                                             index=(0 if src_kind=="TRAI_CAY" else 1),
                                             horizontal=True, key="mut_src_edit")
                     else:
                         src_kind = "TRAI_CAY"
-                        st.caption("Nguồn NVL: Trái cây")
+                        st.caption("Nguồn NVL chính: Trái cây")
 
-                    # Map cũ
                     raws_old = {r["pcode"]: float(r["qty_per_kg"]) for _,r in det.iterrows() if r["kind"] in ["TRAI_CAY","COT"]}
                     adds_old = {r["pcode"]: float(r["qty_per_kg"]) for _,r in det.iterrows() if r["kind"]=="PHU_GIA"}
 
-                    # NVL chính theo nguồn
                     df_src = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name",
                                       {"c": ("TRAI_CAY" if (typ=="COT" or src_kind=="TRAI_CAY") else "COT")})
                     choices_raw = [f"{r['code']} — {r['name']}" for _,r in df_src.iterrows()]
@@ -348,7 +363,6 @@ def page_catalog(conn, user):
                                              step=0.01, min_value=0.0, key=f"raw_edit_{c0}")
                         if q0>0: raw_inputs[c0] = q0
 
-                    # Phụ gia
                     df_add = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code='PHU_GIA' ORDER BY name")
                     choices_add = [f"{r['code']} — {r['name']}" for _,r in df_add.iterrows()]
                     defaults_add = [f"{c} — ..." for c in adds_old.keys()]
