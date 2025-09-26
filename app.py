@@ -725,7 +725,7 @@ def page_catalog(conn, user):
                         st.success("Đã xóa."); st.rerun()
 
     # ======== SỬA / XÓA ========
-    else:
+        else:
         if df_hdr.empty:
             st.info("Chưa có công thức."); 
         else:
