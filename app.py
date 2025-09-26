@@ -245,12 +245,12 @@ def page_catalog(conn, user):
                     src_cat = src_src_choice
 
                 df_src = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": src_cat})
-                src_choices = [f\"{r['code']} — {r['name']}\" for _,r in df_src.iterrows()]
+                src_choices = [f"{r['code']} — {r['name']}" for _,r in df_src.iterrows()]
                 picked_src = st.multiselect("Chọn NVL chính (tick các mã cần có trong công thức)", src_choices, key="new_ct_srcs")
 
                 st.markdown("#### Phụ gia (định lượng per 1 kg sau sơ chế)")
                 df_add = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code='PHU_GIA' ORDER BY name")
-                add_choices = [f\"{r['code']} — {r['name']}\" for _,r in df_add.iterrows()]
+                add_choices = [f"{r['code']} — {r['name']}" for _,r in df_add.iterrows()]
                 picked_add = st.multiselect("Chọn phụ gia", add_choices, key="new_ct_adds")
                 add_map = {}
                 for item in picked_add:
@@ -298,7 +298,7 @@ def page_catalog(conn, user):
             if df_hdr.empty:
                 st.info("Chưa có công thức."); 
             else:
-                pick = st.selectbox("Chọn công thức để sửa/xóa", [f\"{r['code']} — {r['name']} ({r['type']})\" for _,r in df_hdr.iterrows()], key="edit_ct_pick")
+                pick = st.selectbox("Chọn công thức để sửa/xóa", [f"{r['code']} — {r['name']} ({r['type']})" for _,r in df_hdr.iterrows()], key="edit_ct_pick")
                 ct_code = pick.split(" — ",1)[0]
                 hdr = fetch_df(conn, "SELECT * FROM formulas WHERE code=:c", {"c": ct_code}).iloc[0].to_dict()
                 det = fetch_df(conn, "SELECT * FROM formula_inputs WHERE formula_code=:c ORDER BY kind", {"c": ct_code})
@@ -314,7 +314,7 @@ def page_catalog(conn, user):
 
                     out_df = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code IN ('COT','MUT') ORDER BY name")
                     cur_out = hdr.get("output_pcode","")
-                    out_options = [f\"{cur_out} — (hiện tại)\"] + [f\"{r['code']} — {r['name']}\" for _,r in out_df.iterrows() if r['code']!=cur_out]
+                    out_options = [f"{cur_out} — (hiện tại)"] + [f"{r['code']} — {r['name']}" for _,r in out_df.iterrows() if r['code']!=cur_out]
                     out_pick = st.selectbox("Sản phẩm đầu ra", out_options, index=0, key="edit_out")
                     output_pcode = cur_out if "(hiện tại)" in out_pick else out_pick.split(" — ",1)[0]
 
@@ -325,23 +325,23 @@ def page_catalog(conn, user):
                         src_kind = (hdr["note"].split("=",1)[1] or "TRAI_CAY")
                     src_cat = "TRAI_CAY" if src_kind=="TRAI_CAY" else "COT"
                     df_src = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": src_cat})
-                    src_choices = [f\"{r['code']} — {r['name']}\" for _,r in df_src.iterrows()]
+                    src_choices = [f"{r['code']} — {r['name']}" for _,r in df_src.iterrows()]
 
                     old_srcs = (hdr.get("fruits_csv") or "")
-                    defaults = [f\"{c} — {next((x['name'] for _,x in df_src.iterrows() if x['code']==c), '')}\" for c in old_srcs.split(",") if c]
+                    defaults = [f"{c} — {next((x['name'] for _,x in df_src.iterrows() if x['code']==c), '')}" for c in old_srcs.split(",") if c]
                     picked_src = st.multiselect("Chọn NVL chính", src_choices, default=defaults, key="edit_srcs")
 
                     # Phụ gia
                     st.markdown("#### Phụ gia (per 1kg sau sơ chế)")
                     df_add = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code='PHU_GIA' ORDER BY name")
-                    add_choices = [f\"{r['code']} — {r['name']}\" for _,r in df_add.iterrows()]
+                    add_choices = [f"{r['code']} — {r['name']}" for _,r in df_add.iterrows()]
                     # build defaults from formula_inputs
                     add_old = det[det["kind"]=="PHU_GIA"].copy()
                     add_map = {}
                     defaults_add = []
                     for _,r in add_old.iterrows():
                         k=r["pcode"]; v=float(r.get("qty_per_kg") or 0)
-                        defaults_add.append(f\"{k} — {next((x['name'] for _,x in df_add.iterrows() if x['code']==k), '')}\")
+                        defaults_add.append(f"{k} — {next((x['name'] for _,x in df_add.iterrows() if x['code']==k), '')}")
                         add_map[k]=v
                     picked_add = st.multiselect("Chọn phụ gia", add_choices, default=defaults_add, key="edit_adds")
                     new_add_map={}
@@ -492,7 +492,7 @@ def page_sanxuat(conn, user):
         df_ct = fetch_df(conn, "SELECT code,name,type,output_pcode,recovery,fruits_csv,additives_json,cups_per_kg FROM formulas ORDER BY name")
         if df_ct.empty:
             st.warning("Chưa có công thức. Vào Danh mục → Công thức để tạo."); return
-        pick = st.selectbox("Chọn công thức", [f\"{r['code']} — {r['name']} ({r['type']})\" for _,r in df_ct.iterrows()], key="mfg_ct_pick")
+        pick = st.selectbox("Chọn công thức", [f"{r['code']} — {r['name']} ({r['type']})" for _,r in df_ct.iterrows()], key="mfg_ct_pick")
         ct = df_ct[df_ct["code"]==pick.split(" — ",1)[0]].iloc[0].to_dict()
 
         st.markdown("##### Danh sách NVL chính theo công thức")
@@ -506,7 +506,7 @@ def page_sanxuat(conn, user):
         cols = st.columns(2)
         for pcode in fruit_list:
             prod = fetch_df(conn, "SELECT code,name FROM products WHERE code=:c", {"c":pcode})
-            label = f\"{pcode} — {prod.iloc[0]['name'] if not prod.empty else 'Unknown'}\"
+            label = f"{pcode} — {prod.iloc[0]['name'] if not prod.empty else 'Unknown'}"
             kg_tho = st.number_input(f"{label} — KG thô", value=0.0, step=0.01, min_value=0.0, key=f"mfg_raw_{pcode}")
             raw_rows.append({"pcode": pcode, "kg_tho": float(kg_tho)})
 
@@ -537,7 +537,7 @@ def page_sanxuat(conn, user):
                 st.error("Nhập ít nhất 1 loại KG thô > 0."); st.stop()
             # prepare lot id
             if not lot_id:
-                lot_id = f\"LOT{datetime.now().strftime('%Y%m%d%H%M%S')}\"
+                lot_id = f"LOT{datetime.now().strftime('%Y%m%d%H%M%S')}"
             # compute NVL outs: each raw kg_tho, plus additives qty
             outs = []
             for r in raw_rows:
@@ -603,7 +603,7 @@ def page_sanxuat(conn, user):
         if df_wip.empty:
             st.info("Không có lô WIP đang chờ hoàn thành.")
         else:
-            pick = st.selectbox("Chọn lô WIP", [f\"{r['lot_id']} — {r['formula_code']} — plan {r['qty_plan']}kg\" for _,r in df_wip.iterrows()], key="wip_pick2")
+            pick = st.selectbox("Chọn lô WIP", [f"{r['lot_id']} — {r['formula_code']} — plan {r['qty_plan']}kg" for _,r in df_wip.iterrows()], key="wip_pick2")
             lot_id = pick.split(" — ",1)[0]
             lot = df_wip[df_wip["lot_id"]==lot_id].iloc[0].to_dict()
             qty_ok = st.number_input("Sản lượng thực tế nhập kho (kg)", value=float(lot["qty_plan"]), step=0.01, min_value=0.0, key="wip_qty_ok")
