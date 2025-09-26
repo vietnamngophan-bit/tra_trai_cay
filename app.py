@@ -1,7 +1,7 @@
 import streamlit as st
 from core import get_conn, require_login, header_top
 from core import page_dashboard, page_syslog
-from catalog import page_stores, page_users, page_catalog
+from catalog import page_users, page_catalog
 
 st.set_page_config(page_title="Fruit Tea ERP v5",
                    page_icon="🍵",
