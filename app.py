@@ -237,28 +237,28 @@ def page_catalog(conn, user):
             st.success("Đã xoá."); st.rerun()
 
     with tabs[2]:
-    st.markdown("### 📐 Công thức sản xuất")
-    st.caption("CỐT: 1 bước. MỨT: nguồn chính là TRÁI_CÂY hoặc CỐT. Phụ gia nhập dạng JSON (mã→tỷ lệ).")
+        st.markdown("### 📐 Công thức sản xuất")
+        st.caption("CỐT: 1 bước. MỨT: nguồn chính là TRÁI_CÂY hoặc CỐT. Phụ gia nhập dạng JSON (mã→tỷ lệ).")
 
     # Danh sách công thức
-    df_hdr = fetch_df(conn, """
-        SELECT code,name,type,output_pcode,output_uom,
-               recovery,cups_per_kg,fruits_csv,additives_json,note
-        FROM formulas
-        ORDER BY type,name
-    """)
-    st.dataframe(df_hdr, use_container_width=True, height=240)
+        df_hdr = fetch_df(conn, """
+            SELECT code,name,type,output_pcode,output_uom,
+                   recovery,cups_per_kg,fruits_csv,additives_json,note
+            FROM formulas
+            ORDER BY type,name
+        """)
+        st.dataframe(df_hdr, use_container_width=True, height=240)
 
-    st.divider()
-    st.subheader("➕ Thêm công thức")
-    with st.form("fm_ct_new", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            ct_code = st.text_input("Mã CT")
-            ct_name = st.text_input("Tên CT")
-            ct_type = st.selectbox("Loại", ["COT","MUT"])
-            cups    = st.number_input("Số cốc/kg TP", value=0.0, step=0.1, min_value=0.0)
-        with col2:
+        st.divider()
+        st.subheader("➕ Thêm công thức")
+        with st.form("fm_ct_new", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                ct_code = st.text_input("Mã CT")
+                ct_name = st.text_input("Tên CT")
+                ct_type = st.selectbox("Loại", ["COT","MUT"])
+                cups    = st.number_input("Số cốc/kg TP", value=0.0, step=0.1, min_value=0.0)
+            with col2:
             recovery = st.number_input("Hệ số thu hồi (chỉ CỐT)", value=1.0, step=0.01, min_value=0.01, disabled=(ct_type!="COT"))
 
             # SP đầu ra theo loại
