@@ -1,23 +1,19 @@
-# app.py — Khung & Router gọi 3 module (Core, Catalog, Production)
+# app.py — chạy core + catalog (Module 2) + production (Module 3)
+
 import streamlit as st
-
-# === Import từ các module bạn đã có ===
-from core import get_conn, require_login, header_top, write_audit
+from core import get_conn, require_login, header_top, store_selector, fetch_df
 from catalog import page_catalog
-from production import page_production
-# (nếu có dashboard/report sau này thì import thêm, còn bây giờ 3 phần như yêu cầu)
+from production import page_production   # thêm module 3
 
-# ===================== ROUTER DUY NHẤT =====================
 def router(conn, user):
     st.sidebar.markdown("## 📌 Chức năng")
     menu = st.sidebar.radio(
-        "Chọn trang",
-        ["Danh mục", "Sản xuất", "Nhật ký"],  # 3 mục chính theo yêu cầu hiện tại
+        "",
+        ["Danh mục", "Sản xuất", "Nhật ký"],
         index=0,
         label_visibility="collapsed"
     )
 
-    # Gọi trang tương ứng
     if menu == "Danh mục":
         page_catalog(conn, user)
 
@@ -26,28 +22,16 @@ def router(conn, user):
 
     elif menu == "Nhật ký":
         st.markdown("## 🗒️ Nhật ký hệ thống")
-        if st.button("Tải 200 dòng mới nhất"):
-            df = None
-            try:
-                from core import fetch_df
-                df = fetch_df(conn, "SELECT ts,actor,action,detail FROM syslog ORDER BY ts DESC LIMIT 200")
-            except Exception as e:
-                st.error(f"Lỗi tải nhật ký: {e}")
-            if df is not None:
-                st.dataframe(df, use_container_width=True)
-
-    # Footer nhỏ
-    st.sidebar.divider()
-    st.sidebar.caption("DB: Postgres (Supabase)")
-    st.sidebar.caption("Fruit Tea ERP v5")
-
-# ===================== ENTRY POINT =====================
-def main():
-    st.set_page_config(page_title="Fruit Tea ERP", page_icon="🍵", layout="wide")
-    conn = get_conn()                 # từ core.py
-    user = require_login(conn)        # từ core.py
-    header_top(user)                  # từ core.py (hiển thị tên + logout)
-    router(conn, user)                # gọi router duy nhất
+        try:
+            df = fetch_df(conn,
+                "SELECT ts,actor,action,detail FROM syslog ORDER BY ts DESC LIMIT 200")
+            st.dataframe(df, use_container_width=True)
+        except Exception as e:
+            st.error(f"Lỗi tải nhật ký: {e}")
 
 if __name__ == "__main__":
-    main()
+    conn = get_conn()
+    user = require_login(conn)
+    header_top(conn, user)
+    store_selector(conn, user)  # chọn cửa hàng ở sidebar
+    router(conn, user)
