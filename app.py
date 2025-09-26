@@ -3,6 +3,7 @@
 import streamlit as st
 from core import get_conn, require_login, header_top, store_selector
 from catalog import page_catalog
+from production import page_production
 
 def router(conn, user):
     st.sidebar.markdown("## 📌 Chức năng")
@@ -16,3 +17,5 @@ if __name__ == "__main__":
     header_top(conn, user)
     store_selector(conn, user)  # để sẵn ở sidebar
     router(conn, user)
+elif menu=="Sản xuất":
+    page_production(conn, user)
