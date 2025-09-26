@@ -10,12 +10,12 @@ def router(conn, user):
     menu = st.sidebar.radio("", ["Danh mục"], index=0, label_visibility="collapsed")
     if menu == "Danh mục":
         page_catalog(conn, user)
-
+    elif menu=="Sản xuất":
+        page_production(conn, user)
 if __name__ == "__main__":
     conn = get_conn()
     user = require_login(conn)
     header_top(conn, user)
     store_selector(conn, user)  # để sẵn ở sidebar
     router(conn, user)
-elif menu=="Sản xuất":
-    page_production(conn, user)
+
