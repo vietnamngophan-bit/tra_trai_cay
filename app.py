@@ -256,7 +256,7 @@ def page_catalog(conn, user):
             # Phụ gia
             st.markdown("**Phụ gia**")
             df_add = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code='PHU_GIA' ORDER BY name")
-            picked_add = st.multiselect("Chọn phụ gia", [f"{r['code']} — {r['name']}"] for _,r in df_add.iterrows(), key="add_multi_add")
+            picked_add = st.multiselect("Chọn phụ gia", [f"{r['code']} — {r['name']}"] for _,r in df_add.iterrows()], key="add_multi_add")
             add_inputs = {}
             for item in picked_add:
                 c0 = item.split(" — ",1)[0]
