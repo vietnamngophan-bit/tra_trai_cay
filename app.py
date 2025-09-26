@@ -236,612 +236,206 @@ def page_catalog(conn, user):
             write_audit(conn, "PROD_DELETE", del_prod)
             st.success("Đã xoá."); st.rerun()
 
-    # ================== TAB 3: CÔNG THỨC ==================
     with tabs[2]:
-        st.subheader("Công thức (CỐT / MỨT)")
-        st.caption("""
-- **CỐT**: 1 bước. Có *hệ số thu hồi (recovery)* > 0. Có thể dùng 1 hoặc nhiều trái cây (tỷ lệ phần khối lượng), phụ gia là mã → tỷ lệ.
-- **MỨT**: không dùng recovery. Chọn **nguồn NVL** là *TRÁI CÂY* hoặc *CỐT*. Cho phép nhiều trái cây/cốt theo tỷ lệ. Phụ gia dạng mã → tỷ lệ.
-- Lưu **trái cây/cốt** trong `fruits_csv` theo dạng `CODE:TYLE` cách nhau dấu phẩy. **Phụ gia** lưu `additives_json` dạng JSON.
-        """)
+    st.markdown("### 📐 Công thức sản xuất")
+    st.caption("CỐT: 1 bước. MỨT: nguồn chính là TRÁI_CÂY hoặc CỐT. Phụ gia nhập dạng JSON (mã→tỷ lệ).")
 
-        # Danh mục sản phẩm theo nhóm để build lựa chọn
-        df_trai_cay = fetch_df(conn, "SELECT code, name FROM products WHERE cat_code='TRAI_CAY' ORDER BY name")
-        df_cot      = fetch_df(conn, "SELECT code, name FROM products WHERE cat_code='COT' ORDER BY name")
-        df_mut      = fetch_df(conn, "SELECT code, name FROM products WHERE cat_code='MUT' ORDER BY name")
-        df_phu_gia  = fetch_df(conn, "SELECT code, name FROM products WHERE cat_code='PHU_GIA' ORDER BY name")
+    # Danh sách công thức
+    df_hdr = fetch_df(conn, """
+        SELECT code,name,type,output_pcode,output_uom,
+               recovery,cups_per_kg,fruits_csv,additives_json,note
+        FROM formulas
+        ORDER BY type,name
+    """)
+    st.dataframe(df_hdr, use_container_width=True, height=240)
 
-        # Bảng công thức hiện có
-        df_ct = fetch_df(conn, """
-            SELECT code, name, type, output_pcode, output_uom, recovery, cups_per_kg,
-                   fruits_csv, additives_json, note
-            FROM formulas
-            ORDER BY type, name
-        """)
-        st.dataframe(df_ct, use_container_width=True, height=280)
+    st.divider()
+    st.subheader("➕ Thêm công thức")
+    with st.form("fm_ct_new", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            ct_code = st.text_input("Mã CT")
+            ct_name = st.text_input("Tên CT")
+            ct_type = st.selectbox("Loại", ["COT","MUT"])
+            cups    = st.number_input("Số cốc/kg TP", value=0.0, step=0.1, min_value=0.0)
+        with col2:
+            recovery = st.number_input("Hệ số thu hồi (chỉ CỐT)", value=1.0, step=0.01, min_value=0.01, disabled=(ct_type!="COT"))
 
-        # ==== Pick CT để sửa hoặc tạo mới ====
-        left, right = st.columns([1.2, 2.0])
+            # SP đầu ra theo loại
+            out_cat = "COT" if ct_type=="COT" else "MUT"
+            df_out = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": out_cat})
+            out_opts = ["—"] + [f"{r['code']} — {r['name']}" for _, r in df_out.iterrows()]
+            out_pick = st.selectbox("Sản phẩm đầu ra", out_opts, index=0)
+            out_code = "" if out_pick == "—" else out_pick.split(" — ", 1)[0]
 
-        with left:
-            all_codes = ["— Tạo mới —"] + df_ct["code"].tolist()
-            pick_code = st.selectbox("Chọn CT để sửa", all_codes, key="ct_pick")
+        # Nguồn NVL chính
+        if ct_type == "COT":
+            src_kind = "TRAI_CAY"
+            st.caption("Nguồn NVL chính: Trái cây")
+        else:
+            src_kind = st.radio("Nguồn NVL chính (MỨT)", ["TRAI_CAY","COT"], horizontal=True, index=0)
 
-            # Load dữ liệu khi chọn
-            init = {
-                "code": "", "name": "", "type": "COT",
-                "output_pcode": "", "output_uom": "kg",
-                "recovery": 1.0, "cups_per_kg": 0.0,
-                "src_kind": "TRAI_CAY",  # mặc định cho MỨT
-                "fruits_rows": [], "adds_rows": []
-            }
-            if pick_code != "— Tạo mới —":
-                row = df_ct[df_ct["code"] == pick_code].iloc[0].to_dict()
-                init["code"] = row["code"]
-                init["name"] = row["name"]
-                init["type"] = row["type"]
-                init["output_pcode"] = row["output_pcode"]
-                init["output_uom"] = row.get("output_uom") or "kg"
-                init["recovery"] = float(row.get("recovery") or 1.0)
-                init["cups_per_kg"] = float(row.get("cups_per_kg") or 0.0)
-                # note có thể chứa SRC=...
-                if (row.get("note") or "").startswith("SRC="):
-                    init["src_kind"] = (row["note"].split("=",1)[1] or "TRAI_CAY").strip()
-                # fruits_csv: CODE:TYLE, CODE:TYLE
-                fruits_rows = []
-                for tok in (row.get("fruits_csv") or "").split(","):
-                    tok = tok.strip()
-                    if not tok: continue
-                    if ":" in tok:
-                        c, r = tok.split(":", 1)
-                        try:
-                            fruits_rows.append({"code": c.strip(), "ratio": float(r)})
-                        except:
-                            fruits_rows.append({"code": c.strip(), "ratio": 0.0})
-                    else:
-                        fruits_rows.append({"code": tok, "ratio": 1.0})
-                init["fruits_rows"] = fruits_rows
-                # additives_json
-                adds_rows = []
-                try:
-                    m = json.loads(row.get("additives_json") or "{}")
-                    for k, v in m.items():
-                        adds_rows.append({"code": k, "ratio": float(v)})
-                except Exception:
-                    pass
-                init["adds_rows"] = adds_rows
+        src_cat = "TRAI_CAY" if src_kind == "TRAI_CAY" else "COT"
+        df_src = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": src_cat})
+        src_opts = ["—"] + [f"{r['code']} — {r['name']}" for _, r in df_src.iterrows()]
+        src_pick = st.selectbox("Nguyên liệu chính", src_opts, index=0)
+        src_code = "" if src_pick == "—" else src_pick.split(" — ", 1)[0]
 
-        with right:
-            # ------- FORM UPSERT -------
-            with st.form("ct_upsert", clear_on_submit=False):
-                c1, c2, c3 = st.columns([1.1, 2.0, 1.2])
-                with c1:
-                    f_code = st.text_input("Mã CT", value=init["code"], key="ct_code")
-                with c2:
-                    f_name = st.text_input("Tên CT", value=init["name"], key="ct_name")
-                with c3:
-                    f_type = st.selectbox("Loại", ["COT", "MUT"],
-                                          index=(0 if init["type"] != "MUT" else 1),
-                                          key="ct_type")
+        adds_json = st.text_area('Phụ gia JSON (ví dụ {"DUONG":0.05})', value="{}", height=80)
+        note_new  = "" if ct_type == "COT" else f"SRC={src_kind}"
 
-                # Output product theo loại
-                if f_type == "COT":
-                    out_opts = ["— Chọn —"] + [f"{r['code']} — {r['name']}" for _, r in df_cot.iterrows()]
-                    default_out = init["output_pcode"]
-                else:
-                    out_opts = ["— Chọn —"] + [f"{r['code']} — {r['name']}" for _, r in df_mut.iterrows()]
-                    default_out = init["output_pcode"]
-                try:
-                    idx_out = 0 if not default_out else 1 + [o.split(" — ",1)[0] for o in out_opts[1:]].index(default_out)
-                except ValueError:
-                    idx_out = 0
-                out_pick = st.selectbox("Sản phẩm đầu ra", out_opts, index=idx_out, key="ct_outpick")
-                output_pcode = "" if out_pick == "— Chọn —" else out_pick.split(" — ", 1)[0]
+        ok_add = st.form_submit_button("Lưu CT", type="primary")
+        if ok_add:
+            if not ct_code or not ct_name or not out_code or not src_code:
+                st.error("Thiếu mã/tên/SP đầu ra hoặc NVL chính.")
+            else:
+                run_sql(conn, """
+                    INSERT INTO formulas
+                        (code,name,type,output_pcode,output_uom,recovery,cups_per_kg,fruits_csv,additives_json,note)
+                    VALUES (:c,:n,:t,:o,'kg',:r,:k,:f,:a,:x)
+                    ON CONFLICT (code) DO UPDATE SET
+                        name=EXCLUDED.name,
+                        type=EXCLUDED.type,
+                        output_pcode=EXCLUDED.output_pcode,
+                        recovery=EXCLUDED.recovery,
+                        cups_per_kg=EXCLUDED.cups_per_kg,
+                        fruits_csv=EXCLUDED.fruits_csv,
+                        additives_json=EXCLUDED.additives_json,
+                        note=EXCLUDED.note
+                """, {
+                    "c": ct_code.strip(),
+                    "n": ct_name.strip(),
+                    "t": ct_type,
+                    "o": out_code,
+                    "r": float(recovery) if ct_type=="COT" else 1.0,
+                    "k": float(cups),
+                    "f": src_code,
+                    "a": adds_json.strip(),
+                    "x": note_new
+                })
+                write_audit(conn, "FORMULA_UPSERT", ct_code)
+                st.success("Đã lưu công thức."); st.rerun()
 
-                c4, c5, c6 = st.columns([1, 1, 1])
-                with c4:
-                    output_uom = st.text_input("ĐVT TP", value=init["output_uom"], key="ct_uom", disabled=True)
-                with c5:
-                    cups_per_kg = st.number_input("Cốc/kg TP", value=float(init["cups_per_kg"]),
-                                                  step=0.1, min_value=0.0, key="ct_cups")
-                with c6:
-                    if f_type == "COT":
-                        recovery = st.number_input("Hệ số thu hồi (CỐT)",
-                                                   value=max(0.01, float(init["recovery"])),
-                                                   step=0.01, min_value=0.01, key="ct_recovery")
-                    else:
-                        recovery = 1.0
-                        st.text_input("Hệ số thu hồi (MỨT)", value="—", disabled=True, key="ct_recovery_fake")
+    st.divider()
+    st.subheader("✏️ Sửa / 🗑️ Xoá công thức")
 
-                # Nguồn NVL cho MỨT
-                if f_type == "MUT":
-                    src_kind = st.radio("Nguồn NVL cho MỨT", ["TRAI_CAY", "COT"],
-                                        index=(0 if init["src_kind"] != "COT" else 1),
-                                        horizontal=True, key="ct_src_kind")
-                else:
-                    src_kind = "TRAI_CAY"
-
-                # ====== Bảng thành phần ======
-                st.markdown("**Thành phần chính (trái cây/cốt) – tỷ lệ**")
-                if f_type == "COT" or (f_type == "MUT" and src_kind == "TRAI_CAY"):
-                    base_df = df_trai_cay
-                else:
-                    base_df = df_cot
-                base_codes = base_df["code"].tolist()
-                if not init["fruits_rows"]:
-                    init_rows = [{"code": "", "ratio": 1.0}]
-                else:
-                    init_rows = init["fruits_rows"]
-                fruits_rows = st.data_editor(
-                    pd.DataFrame(init_rows),
-                    column_config={
-                        "code": st.column_config.SelectboxColumn(
-                            "Mã NVL",
-                            options=[""] + base_codes,
-                            width="medium"
-                        ),
-                        "ratio": st.column_config.NumberColumn(
-                            "Tỷ lệ",
-                            step=0.01, min_value=0.0, max_value=9999.0
-                        ),
-                    },
-                    num_rows="dynamic",
-                    use_container_width=True,
-                    key="ct_fruits_rows"
-                )
-
-                st.markdown("**Phụ gia (mã → tỷ lệ)**")
-                pg_codes = df_phu_gia["code"].tolist()
-                if not init["adds_rows"]:
-                    init_adds = [{"code": "", "ratio": 0.0}]
-                else:
-                    init_adds = init["adds_rows"]
-                adds_rows = st.data_editor(
-                    pd.DataFrame(init_adds),
-                    column_config={
-                        "code": st.column_config.SelectboxColumn(
-                            "Mã phụ gia",
-                            options=[""] + pg_codes,
-                            width="medium"
-                        ),
-                        "ratio": st.column_config.NumberColumn(
-                            "Tỷ lệ",
-                            step=0.01, min_value=0.0, max_value=9999.0
-                        ),
-                    },
-                    num_rows="dynamic",
-                    use_container_width=True,
-                    key="ct_adds_rows"
-                )
-
-                submit = st.form_submit_button("💾 Lưu / Cập nhật CT", type="primary")
-
-            # ====== Xử lý lưu ======
-            if submit:
-                if not f_code or not f_name or not output_pcode:
-                    st.error("Thiếu **Mã CT / Tên CT / Sản phẩm đầu ra**.")
-                else:
-                    # Validate thành phần
-                    clean_fruits = []
-                    for _, r in fruits_rows.dropna().iterrows():
-                        c = (r.get("code") or "").strip()
-                        try:
-                            ratio = float(r.get("ratio") or 0.0)
-                        except:
-                            ratio = 0.0
-                        if c and ratio > 0:
-                            if c not in base_codes:
-                                st.error(f"NVL `{c}` không hợp lệ cho loại nguồn đã chọn.")
-                                st.stop()
-                            clean_fruits.append((c, ratio))
-                    if not clean_fruits:
-                        st.error("Chưa khai báo thành phần chính.")
-                        st.stop()
-                    fruits_csv = ",".join([f"{c}:{ratio}" for c, ratio in clean_fruits])
-
-                    # Phụ gia
-                    adds_map = {}
-                    for _, r in adds_rows.dropna().iterrows():
-                        c = (r.get("code") or "").strip()
-                        try:
-                            ratio = float(r.get("ratio") or 0.0)
-                        except:
-                            ratio = 0.0
-                        if c and ratio > 0:
-                            if c not in pg_codes:
-                                st.error(f"Phụ gia `{c}` không hợp lệ.")
-                                st.stop()
-                            adds_map[c] = ratio
-                    adds_json = json.dumps(adds_map, ensure_ascii=False)
-
-                    note = ("SRC=" + src_kind) if f_type == "MUT" else ""
-
-                    run_sql(conn, """
-                        INSERT INTO formulas(
-                            code, name, type, output_pcode, output_uom,
-                            recovery, cups_per_kg, fruits_csv, additives_json, note
-                        )
-                        VALUES (:c,:n,:t,:o,:u,:r,:k,:f,:a,:x)
-                        ON CONFLICT (code) DO UPDATE SET
-                            name=EXCLUDED.name,
-                            type=EXCLUDED.type,
-                            output_pcode=EXCLUDED.output_pcode,
-                            output_uom=EXCLUDED.output_uom,
-                            recovery=EXCLUDED.recovery,
-                            cups_per_kg=EXCLUDED.cups_per_kg,
-                            fruits_csv=EXCLUDED.fruits_csv,
-                            additives_json=EXCLUDED.additives_json,
-                            note=EXCLUDED.note
-                    """, {
-                        "c": f_code.strip(),
-                        "n": f_name.strip(),
-                        "t": f_type,
-                        "o": output_pcode,
-                        "u": output_uom,
-                        "r": float(recovery),
-                        "k": float(cups_per_kg),
-                        "f": fruits_csv,
-                        "a": adds_json,
-                        "x": note
-                    })
-                    write_audit(conn, "FORMULA_UPSERT", f_code.strip())
-                    st.success("Đã lưu công thức.")
-                    st.rerun()
-
-        # ==== Xoá CT ====
-        st.markdown("---")
-        del_ct = st.selectbox("Chọn CT để xoá", ["—"] + df_ct["code"].tolist(), key="ct_del_pick")
-        if del_ct != "—" and st.button("🗑️ Xoá công thức", key="ct_delete_btn"):
-            run_sql(conn, "DELETE FROM formulas WHERE code=:c", {"c": del_ct})
-            write_audit(conn, "FORMULA_DELETE", del_ct)
-            st.success("Đã xoá.")
-            st.rerun()# --- formulas (PRO; dùng formulas + formula_inputs) ---
-    with tabs[2]:
-        st.info(
-            "CỐT = 1 bước (có hệ số thu hồi). "
-            "MỨT = 2 bước (không có hệ số). "
-            "Công thức hỗ trợ nhiều NVL chính + nhiều phụ gia. "
-            "Định lượng nhập theo **kg NVL / 1kg TP**."
+    if df_hdr.empty:
+        st.info("Chưa có công thức.")
+    else:
+        pick = st.selectbox(
+            "Chọn CT",
+            [f"{r['code']} — {r['name']}" for _, r in df_hdr.iterrows()],
+            key="ct_pick_edit"
         )
+        sel_code = pick.split(" — ", 1)[0]
+        hdr = fetch_df(conn, "SELECT * FROM formulas WHERE code=:c", {"c": sel_code}).iloc[0].to_dict()
+        det = fetch_df(conn, "SELECT * FROM formula_inputs WHERE formula_code=:c ORDER BY kind", {"c": sel_code})
 
-        df_hdr = fetch_df(conn, """
-            SELECT code,name,type,output_pcode,output_uom,recovery,cups_per_kg,note
-            FROM formulas
-            ORDER BY type,name
-        """)
-        st.dataframe(df_hdr, use_container_width=True, height=280)
-
-        mode = st.radio("Chế độ", ["Tạo mới", "Sửa/Xóa"], horizontal=True)
-
-    # ======== TẠO MỚI ========
-    if mode == "Tạo mới":
-        with st.form("fm_ct_new", clear_on_submit=True):
+        with st.form("fm_ct_edit", clear_on_submit=True):
             colA, colB = st.columns(2)
             with colA:
-                code = st.text_input("Mã công thức")
-                name = st.text_input("Tên công thức")
-                typ  = st.selectbox("Loại", ["COT","MUT"])
+                name_e = st.text_input("Tên công thức", value=hdr.get("name") or "")
+                typ_e  = st.selectbox("Loại", ["COT","MUT"], index=(0 if hdr.get("type")=="COT" else 1))
             with colB:
-                cups = st.number_input("Số cốc/kg TP", value=0.0, step=0.1, min_value=0.0)
-                if typ == "COT":
-                    recovery = st.number_input("Hệ số thu hồi (chỉ CỐT)", value=1.10, step=0.01, min_value=0.01)
-                else:
-                    st.caption("MỨT: không có hệ số thu hồi (mặc định 1.0)")
-                    recovery = 1.0
+                cups_e = st.number_input("Số cốc/kg TP", value=float(hdr.get("cups_per_kg") or 0.0), step=0.1, min_value=0.0)
+                rec_e  = st.number_input("Hệ số thu hồi (chỉ CỐT)",
+                                         value=float(hdr.get("recovery") or 1.0), step=0.01, min_value=0.01,
+                                         disabled=(typ_e!="COT"))
 
-            # Sản phẩm đầu ra theo loại
-            out_cat = "COT" if typ=="COT" else "MUT"
-            df_out = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": out_cat})
-            out_options = ["— Chọn —"] + [f"{r['code']} — {r['name']}" for _,r in df_out.iterrows()]
-            out_pick = st.selectbox("Sản phẩm đầu ra", out_options, index=0)
-            output_pcode = "" if out_pick=="— Chọn —" else out_pick.split(" — ",1)[0]
+            # Đầu ra mới
+            out_cat_e = "COT" if typ_e=="COT" else "MUT"
+            df_out_e = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": out_cat_e})
+            cur_out = hdr.get("output_pcode")
+            out_opts_e = [f"{cur_out} — (hiện tại)"] + [f"{r['code']} — {r['name']}" for _, r in df_out_e.iterrows() if r["code"]!=cur_out]
+            out_pick_e = st.selectbox("Sản phẩm đầu ra", out_opts_e, index=0)
+            out_code_e = cur_out if " (hiện tại)" in out_pick_e else out_pick_e.split(" — ", 1)[0]
 
-            # Nguồn NVL chính
-            if typ == "COT":
-                src_kind = "TRAI_CAY"   # NVL chính của CỐT = trái cây
-                st.caption("Nguồn NVL chính: Trái cây")
+            # Nguồn NVL chính (chỉ MỨT)
+            if typ_e == "MUT":
+                cur_src = "TRAI_CAY"
+                nt = (hdr.get("note") or "")
+                if nt.startswith("SRC="):
+                    cur_src = nt.split("=", 1)[1] or "TRAI_CAY"
+                src_kind_e = st.radio("Nguồn NVL chính (MỨT)", ["TRAI_CAY","COT"],
+                                      index=(0 if cur_src=="TRAI_CAY" else 1), horizontal=True)
             else:
-                src_kind = st.radio("Nguồn NVL chính (chỉ MỨT)", ["TRAI_CAY","COT"], horizontal=True, index=0)
+                src_kind_e = "TRAI_CAY"
+                st.caption("Nguồn NVL chính: Trái cây")
 
-            # Chọn NVL chính (nhiều)
+            # Phần inputs cũ để set default
+            raw_old = det[det["kind"].isin(["TRAI_CAY","COT"])].copy()
+            add_old = det[det["kind"]=="PHU_GIA"].copy()
+
             st.markdown("#### Nguyên liệu chính")
-            src_cat = "TRAI_CAY" if src_kind=="TRAI_CAY" else "COT"
-            df_src = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name",
-                              {"c": src_cat})
-            src_multi = st.multiselect(
-                "Chọn NVL chính",
-                [f"{r['code']} — {r['name']}" for _,r in df_src.iterrows()],
-                key="src_multi_new"
-            )
-            raw_inputs = {}
-            for item in src_multi:
-                c0 = item.split(" — ",1)[0]
-                q0 = st.number_input(f"{item} — kg / 1kg TP", value=0.0, step=0.01, min_value=0.0, key=f"raw_new_{c0}")
-                if q0>0: raw_inputs[c0] = q0
+            src_cat_e = "TRAI_CAY" if src_kind_e=="TRAI_CAY" else "COT"
+            df_src_e = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": src_cat_e})
+            choices_raw = [f"{r['code']} — {r['name']}" for _, r in df_src_e.iterrows()]
+            raw_map = {r["pcode"]: float(r["qty_per_kg"]) for _, r in raw_old.iterrows()}
+            defaults_raw = [f"{r['pcode']} — {fetch_df(conn,'SELECT name FROM products WHERE code=:c',{'c':r['pcode']}).iloc[0]['name']}"
+                            for _, r in raw_old.iterrows() if r["pcode"] in [x.split(" — ",1)[0] for x in choices_raw]]
+            picked_raw = st.multiselect("Chọn NVL chính", choices_raw, default=defaults_raw, key="raw_multi_edit")
 
-            # Chọn phụ gia (nhiều)
+            raw_inputs = {}
+            for item in picked_raw:
+                c0 = item.split(" — ", 1)[0]
+                q0 = st.number_input(f"{item} — kg / 1kg TP", value=float(raw_map.get(c0, 0.0)),
+                                     step=0.01, min_value=0.0, key=f"raw_edit_{c0}")
+                if q0 > 0:
+                    raw_inputs[c0] = q0
+
             st.markdown("#### Phụ gia")
             df_add = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code='PHU_GIA' ORDER BY name")
-            add_multi = st.multiselect(
-                "Chọn phụ gia",
-                [f"{r['code']} — {r['name']}" for _,r in df_add.iterrows()],
-                key="add_multi_new"
-            )
+            choices_add = [f"{r['code']} — {r['name']}" for _, r in df_add.iterrows()]
+            add_map = {r["pcode"]: float(r["qty_per_kg"]) for _, r in add_old.iterrows()}
+            defaults_add = [f"{r['pcode']} — {fetch_df(conn,'SELECT name FROM products WHERE code=:c',{'c':r['pcode']}).iloc[0]['name']}"
+                            for _, r in add_old.iterrows() if r["pcode"] in [x.split(" — ",1)[0] for x in choices_add]]
+            picked_add = st.multiselect("Chọn phụ gia", choices_add, default=defaults_add, key="add_multi_edit")
+
             add_inputs = {}
-            for item in add_multi:
-                c0 = item.split(" — ",1)[0]
-                q0 = st.number_input(f"{item} — kg / 1kg TP", value=0.0, step=0.01, min_value=0.0, key=f"add_new_{c0}")
-                if q0>0: add_inputs[c0] = q0
+            for item in picked_add:
+                c0 = item.split(" — ", 1)[0]
+                q0 = st.number_input(f"{item} — kg / 1kg TP", value=float(add_map.get(c0, 0.0)),
+                                     step=0.01, min_value=0.0, key=f"add_edit_{c0}")
+                if q0 > 0:
+                    add_inputs[c0] = q0
 
-            ok = st.form_submit_button("💾 Lưu công thức", type="primary")
-            if ok:
-                if not code or not name or not output_pcode or (typ=="COT" and not raw_inputs):
-                    st.error("Thiếu mã/tên/SP đầu ra/NVL."); 
-                else:
-                    note = "" if typ=="COT" else (f"SRC={'TRAI_CAY' if src_kind=='TRAI_CAY' else 'COT'}")
-                    # Header
-                    run_sql(conn, """
-                      INSERT INTO formulas(code,name,type,output_pcode,output_uom,recovery,cups_per_kg,note)
-                      VALUES (:c,:n,:t,:o,'kg',:r,:k,:x)
-                      ON CONFLICT (code) DO UPDATE SET
-                        name=EXCLUDED.name, type=EXCLUDED.type, output_pcode=EXCLUDED.output_pcode,
-                        output_uom=EXCLUDED.output_uom, recovery=EXCLUDED.recovery,
-                        cups_per_kg=EXCLUDED.cups_per_kg, note=EXCLUDED.note
-                    """, {"c": code.strip(), "n": name.strip(), "t": typ, "o": output_pcode,
-                          "r": float(recovery), "k": float(cups), "x": note})
-                    # Detail
-                    run_sql(conn, "DELETE FROM formula_inputs WHERE formula_code=:c", {"c": code.strip()})
-                    for k,v in raw_inputs.items():
+            colX, colY = st.columns(2)
+            with colX:
+                if st.form_submit_button("💾 Cập nhật", type="primary"):
+                    if not name_e or not out_code_e or (typ_e=="COT" and not raw_inputs):
+                        st.error("Thiếu tên/SP đầu ra hoặc NVL.")
+                    else:
+                        note_e = "" if typ_e=="COT" else f"SRC={'TRAI_CAY' if src_kind_e=='TRAI_CAY' else 'COT'}"
                         run_sql(conn, """
-                          INSERT INTO formula_inputs(formula_code,pcode,qty_per_kg,kind)
-                          VALUES (:f,:p,:q,:k)
-                        """, {"f": code.strip(), "p": k, "q": float(v),
-                              "k": ("TRAI_CAY" if src_cat=="TRAI_CAY" else "COT")})
-                    for k,v in add_inputs.items():
-                        run_sql(conn, """
-                          INSERT INTO formula_inputs(formula_code,pcode,qty_per_kg,kind)
-                          VALUES (:f,:p,:q,'PHU_GIA')
-                        """, {"f": code.strip(), "p": k, "q": float(v)})
-                    write_audit(conn, "FORMULA_UPSERT", code)
-                    st.success("Đã lưu/cập nhật công thức."); st.rerun()
-
-    # ======== SỬA / XÓA ========
-    else:
-        if df_hdr.empty:
-            st.info("Chưa có công thức."); 
-        else:
-            pick = st.selectbox("Chọn CT", [f"{r['code']} — {r['name']}" for _,r in df_hdr.iterrows()], key="ct_pick_edit")
-            ct_code = pick.split(" — ",1)[0]
-            hdr = fetch_df(conn, "SELECT * FROM formulas WHERE code=:c", {"c": ct_code}).iloc[0].to_dict()
-            det = fetch_df(conn, "SELECT * FROM formula_inputs WHERE formula_code=:c ORDER BY kind", {"c": ct_code})
-
-            with st.form("fm_ct_edit", clear_on_submit=True):
-                colA, colB = st.columns(2)
-                with colA:
-                    name = st.text_input("Tên công thức", value=hdr["name"] or "")
-                    typ  = st.selectbox("Loại", ["COT","MUT"], index=(0 if hdr["type"]=="COT" else 1))
-                with colB:
-                    cups = st.number_input("Số cốc/kg TP", value=float(hdr.get("cups_per_kg") or 0.0), step=0.1, min_value=0.0)
-                    recovery = st.number_input("Hệ số thu hồi (chỉ CỐT)",
-                                               value=float(hdr.get("recovery") or 1.0), step=0.01, min_value=0.01,
-                                               disabled=(typ!="COT"), key="rec_edit")
-
-                # Đầu ra theo loại hiện chọn
-                out_cat = "COT" if typ=="COT" else "MUT"
-                df_out = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": out_cat})
-                lbls = [f"{r['code']} — {r['name']}"] + []  # placeholder để gợi ý
-                cur_out = hdr["output_pcode"]
-                out_options = [f"{cur_out} — (hiện tại)"] + [f"{r['code']} — {r['name']}" for _,r in df_out.iterrows() if r["code"]!=cur_out]
-                out_pick = st.selectbox("Sản phẩm đầu ra", out_options, index=0)
-                output_pcode = cur_out if " (hiện tại)" in out_pick else out_pick.split(" — ",1)[0]
-
-                # Nguồn NVL chính (chỉ MỨT)
-                if typ=="MUT":
-                    src_kind = "TRAI_CAY"
-                    if (hdr.get("note") or "").startswith("SRC="):
-                        src_kind = (hdr["note"].split("=",1)[1] or "TRAI_CAY")
-                    src_kind = st.radio("Nguồn NVL chính (chỉ MỨT)", ["TRAI_CAY","COT"],
-                                        index=(0 if src_kind=="TRAI_CAY" else 1), horizontal=True, key="mut_src_edit")
-                else:
-                    src_kind = "TRAI_CAY"
-                    st.caption("Nguồn NVL chính: Trái cây")
-
-                # Tách det cũ để set default
-                raw_old = det[det["kind"].isin(["TRAI_CAY","COT"])].copy()
-                add_old = det[det["kind"]=="PHU_GIA"].copy()
-
-                # NVL chính
-                st.markdown("#### Nguyên liệu chính")
-                src_cat = "TRAI_CAY" if src_kind=="TRAI_CAY" else "COT"
-                df_src = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": src_cat})
-                choices_raw = [f"{r['code']} — {r['name']}" for _,r in df_src.iterrows()]
-                defaults_raw = []
-                raw_map = {r["pcode"]: float(r["qty_per_kg"]) for _,r in raw_old.iterrows()}
-                for r in df_src.itertuples():
-                    key = f"{r.code} — {r.name}"
-                    if r.code in raw_map: defaults_raw.append(key)
-                picked_raw = st.multiselect("Chọn NVL chính", choices_raw, default=defaults_raw, key="src_multi_edit")
-
-                raw_inputs = {}
-                for item in picked_raw:
-                    c0 = item.split(" — ",1)[0]
-                    q0 = st.number_input(f"{item} — kg / 1kg TP",
-                                         value=float(raw_map.get(c0,0.0)), step=0.01, min_value=0.0,
-                                         key=f"raw_edit_{c0}")
-                    if q0>0: raw_inputs[c0] = q0
-
-                # Phụ gia
-                st.markdown("#### Phụ gia")
-                df_add = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code='PHU_GIA' ORDER BY name")
-                choices_add = [f"{r['code']} — {r['name']}" for _,r in df_add.iterrows()]
-                add_map = {r["pcode"]: float(r["qty_per_kg"]) for _,r in add_old.iterrows()}
-                defaults_add = []
-                for r in df_add.itertuples():
-                    key = f"{r.code} — {r.name}"
-                    if r.code in add_map: defaults_add.append(key)
-                picked_add = st.multiselect("Chọn phụ gia", choices_add, default=defaults_add, key="add_multi_edit")
-
-                add_inputs = {}
-                for item in picked_add:
-                    c0 = item.split(" — ",1)[0]
-                    q0 = st.number_input(f"{item} — kg / 1kg TP",
-                                         value=float(add_map.get(c0,0.0)), step=0.01, min_value=0.0,
-                                         key=f"add_edit_{c0}")
-                    if q0>0: add_inputs[c0] = q0
-
-                colX, colY = st.columns(2)
-                with colX:
-                    if st.form_submit_button("💾 Cập nhật", type="primary"):
-                        if not name or not output_pcode or (typ=="COT" and not raw_inputs):
-                            st.error("Thiếu tên/SP đầu ra/NVL."); 
-                        else:
-                            note = "" if typ=="COT" else (f"SRC={'TRAI_CAY' if src_kind=='TRAI_CAY' else 'COT'}")
+                            UPDATE formulas
+                            SET name=:n, type=:t, output_pcode=:o, output_uom='kg',
+                                recovery=:r, cups_per_kg=:k, note=:x
+                            WHERE code=:c
+                        """, {
+                            "n": name_e.strip(), "t": typ_e, "o": out_code_e,
+                            "r": float(rec_e) if typ_e=="COT" else 1.0,
+                            "k": float(cups_e), "x": note_e, "c": sel_code
+                        })
+                        run_sql(conn, "DELETE FROM formula_inputs WHERE formula_code=:c", {"c": sel_code})
+                        for k, v in raw_inputs.items():
                             run_sql(conn, """
-                              UPDATE formulas
-                              SET name=:n, type=:t, output_pcode=:o, output_uom='kg',
-                                  recovery=:r, cups_per_kg=:k, note=:x
-                              WHERE code=:c
-                            """, {"n": name.strip(), "t": typ, "o": output_pcode,
-                                  "r": (float(recovery) if typ=="COT" else 1.0),
-                                  "k": float(cups), "x": note, "c": ct_code})
-                            run_sql(conn, "DELETE FROM formula_inputs WHERE formula_code=:c", {"c": ct_code})
-                            for k,v in raw_inputs.items():
-                                run_sql(conn, """
-                                  INSERT INTO formula_inputs(formula_code,pcode,qty_per_kg,kind)
-                                  VALUES (:f,:p,:q,:k)
-                                """, {"f": ct_code, "p": k, "q": float(v),
-                                      "k": ("TRAI_CAY" if src_cat=="TRAI_CAY" else "COT")})
-                            for k,v in add_inputs.items():
-                                run_sql(conn, """
-                                  INSERT INTO formula_inputs(formula_code,pcode,qty_per_kg,kind)
-                                  VALUES (:f,:p,:q,'PHU_GIA')
-                                """, {"f": ct_code, "p": k, "q": float(v)})
-                            write_audit(conn, "FORMULA_UPDATE", ct_code)
-                            st.success("Đã cập nhật."); st.rerun()
-                with colY:
-                    if st.form_submit_button("🗑️ Xóa công thức"):
-                        run_sql(conn, "DELETE FROM formulas WHERE code=:c", {"c": ct_code})
-                        write_audit(conn, "FORMULA_DELETE", ct_code)
-                        st.success("Đã xóa."); st.rerun()
-
-    # ======== SỬA / XÓA ========
-        else:
-        if df_hdr.empty:
-            st.info("Chưa có công thức."); 
-        else:
-            pick = st.selectbox("Chọn CT", [f"{r['code']} — {r['name']}" for _,r in df_hdr.iterrows()], key="ct_pick_edit")
-            ct_code = pick.split(" — ",1)[0]
-            hdr = fetch_df(conn, "SELECT * FROM formulas WHERE code=:c", {"c": ct_code}).iloc[0].to_dict()
-            det = fetch_df(conn, "SELECT * FROM formula_inputs WHERE formula_code=:c ORDER BY kind", {"c": ct_code})
-
-            with st.form("fm_ct_edit", clear_on_submit=True):
-                colA, colB = st.columns(2)
-                with colA:
-                    name = st.text_input("Tên công thức", value=hdr["name"] or "")
-                    typ  = st.selectbox("Loại", ["COT","MUT"], index=(0 if hdr["type"]=="COT" else 1))
-                with colB:
-                    cups = st.number_input("Số cốc/kg TP", value=float(hdr.get("cups_per_kg") or 0.0), step=0.1, min_value=0.0)
-                    recovery = st.number_input("Hệ số thu hồi (chỉ CỐT)",
-                                               value=float(hdr.get("recovery") or 1.0), step=0.01, min_value=0.01,
-                                               disabled=(typ!="COT"), key="rec_edit")
-
-                # Đầu ra theo loại hiện chọn
-                out_cat = "COT" if typ=="COT" else "MUT"
-                df_out = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": out_cat})
-                lbls = [f"{r['code']} — {r['name']}"] + []  # placeholder để gợi ý
-                cur_out = hdr["output_pcode"]
-                out_options = [f"{cur_out} — (hiện tại)"] + [f"{r['code']} — {r['name']}" for _,r in df_out.iterrows() if r["code"]!=cur_out]
-                out_pick = st.selectbox("Sản phẩm đầu ra", out_options, index=0)
-                output_pcode = cur_out if " (hiện tại)" in out_pick else out_pick.split(" — ",1)[0]
-
-                # Nguồn NVL chính (chỉ MỨT)
-                if typ=="MUT":
-                    src_kind = "TRAI_CAY"
-                    if (hdr.get("note") or "").startswith("SRC="):
-                        src_kind = (hdr["note"].split("=",1)[1] or "TRAI_CAY")
-                    src_kind = st.radio("Nguồn NVL chính (chỉ MỨT)", ["TRAI_CAY","COT"],
-                                        index=(0 if src_kind=="TRAI_CAY" else 1), horizontal=True, key="mut_src_edit")
-                else:
-                    src_kind = "TRAI_CAY"
-                    st.caption("Nguồn NVL chính: Trái cây")
-
-                # Tách det cũ để set default
-                raw_old = det[det["kind"].isin(["TRAI_CAY","COT"])].copy()
-                add_old = det[det["kind"]=="PHU_GIA"].copy()
-
-                # NVL chính
-                st.markdown("#### Nguyên liệu chính")
-                src_cat = "TRAI_CAY" if src_kind=="TRAI_CAY" else "COT"
-                df_src = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": src_cat})
-                choices_raw = [f"{r['code']} — {r['name']}" for _,r in df_src.iterrows()]
-                defaults_raw = []
-                raw_map = {r["pcode"]: float(r["qty_per_kg"]) for _,r in raw_old.iterrows()}
-                for r in df_src.itertuples():
-                    key = f"{r.code} — {r.name}"
-                    if r.code in raw_map: defaults_raw.append(key)
-                picked_raw = st.multiselect("Chọn NVL chính", choices_raw, default=defaults_raw, key="src_multi_edit")
-
-                raw_inputs = {}
-                for item in picked_raw:
-                    c0 = item.split(" — ",1)[0]
-                    q0 = st.number_input(f"{item} — kg / 1kg TP",
-                                         value=float(raw_map.get(c0,0.0)), step=0.01, min_value=0.0,
-                                         key=f"raw_edit_{c0}")
-                    if q0>0: raw_inputs[c0] = q0
-
-                # Phụ gia
-                st.markdown("#### Phụ gia")
-                df_add = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code='PHU_GIA' ORDER BY name")
-                choices_add = [f"{r['code']} — {r['name']}" for _,r in df_add.iterrows()]
-                add_map = {r["pcode"]: float(r["qty_per_kg"]) for _,r in add_old.iterrows()}
-                defaults_add = []
-                for r in df_add.itertuples():
-                    key = f"{r.code} — {r.name}"
-                    if r.code in add_map: defaults_add.append(key)
-                picked_add = st.multiselect("Chọn phụ gia", choices_add, default=defaults_add, key="add_multi_edit")
-
-                add_inputs = {}
-                for item in picked_add:
-                    c0 = item.split(" — ",1)[0]
-                    q0 = st.number_input(f"{item} — kg / 1kg TP",
-                                         value=float(add_map.get(c0,0.0)), step=0.01, min_value=0.0,
-                                         key=f"add_edit_{c0}")
-                    if q0>0: add_inputs[c0] = q0
-
-                colX, colY = st.columns(2)
-                with colX:
-                    if st.form_submit_button("💾 Cập nhật", type="primary"):
-                        if not name or not output_pcode or (typ=="COT" and not raw_inputs):
-                            st.error("Thiếu tên/SP đầu ra/NVL."); 
-                        else:
-                            note = "" if typ=="COT" else (f"SRC={'TRAI_CAY' if src_kind=='TRAI_CAY' else 'COT'}")
+                                INSERT INTO formula_inputs(formula_code,pcode,qty_per_kg,kind)
+                                VALUES (:f,:p,:q,:k)
+                            """, {"f": sel_code, "p": k, "q": float(v),
+                                  "k": ("TRAI_CAY" if src_cat_e=="TRAI_CAY" else "COT")})
+                        for k, v in add_inputs.items():
                             run_sql(conn, """
-                              UPDATE formulas
-                              SET name=:n, type=:t, output_pcode=:o, output_uom='kg',
-                                  recovery=:r, cups_per_kg=:k, note=:x
-                              WHERE code=:c
-                            """, {"n": name.strip(), "t": typ, "o": output_pcode,
-                                  "r": (float(recovery) if typ=="COT" else 1.0),
-                                  "k": float(cups), "x": note, "c": ct_code})
-                            run_sql(conn, "DELETE FROM formula_inputs WHERE formula_code=:c", {"c": ct_code})
-                            for k,v in raw_inputs.items():
-                                run_sql(conn, """
-                                  INSERT INTO formula_inputs(formula_code,pcode,qty_per_kg,kind)
-                                  VALUES (:f,:p,:q,:k)
-                                """, {"f": ct_code, "p": k, "q": float(v),
-                                      "k": ("TRAI_CAY" if src_cat=="TRAI_CAY" else "COT")})
-                            for k,v in add_inputs.items():
-                                run_sql(conn, """
-                                  INSERT INTO formula_inputs(formula_code,pcode,qty_per_kg,kind)
-                                  VALUES (:f,:p,:q,'PHU_GIA')
-                                """, {"f": ct_code, "p": k, "q": float(v)})
-                            write_audit(conn, "FORMULA_UPDATE", ct_code)
-                            st.success("Đã cập nhật."); st.rerun()
-                with colY:
-                    if st.form_submit_button("🗑️ Xóa công thức"):
-                        run_sql(conn, "DELETE FROM formulas WHERE code=:c", {"c": ct_code})
-                        write_audit(conn, "FORMULA_DELETE", ct_code)
-                        st.success("Đã xóa."); st.rerun()
+                                INSERT INTO formula_inputs(formula_code,pcode,qty_per_kg,kind)
+                                VALUES (:f,:p,:q,'PHU_GIA')
+                            """, {"f": sel_code, "p": k, "q": float(v)})
+                        write_audit(conn, "FORMULA_UPDATE", sel_code)
+                        st.success("Đã cập nhật."); st.rerun()
+            with colY:
+                if st.form_submit_button("🗑️ Xoá công thức"):
+                    run_sql(conn, "DELETE FROM formulas WHERE code=:c", {"c": sel_code})
+                    write_audit(conn, "FORMULA_DELETE", sel_code)
+                    st.success("Đã xoá."); st.rerun()
+
 
 def page_kho(conn, user):
     st.markdown("### 🏬 Kho")
