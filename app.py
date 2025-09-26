@@ -194,6 +194,7 @@ def page_catalog(conn, user):
         if pick!="—" and st.button("Xoá sản phẩm"):
             run_sql(conn,"DELETE FROM products WHERE code=:c",{"c":pick}); st.rerun()
     # --- formulas (PRO; dùng formulas + formula_inputs) ---
+    # --- formulas (PRO; dùng formulas + formula_inputs) ---
 with tabs[2]:
     st.info(
         "CỐT = 1 bước (có hệ số thu hồi). "
@@ -421,7 +422,6 @@ with tabs[2]:
                         run_sql(conn, "DELETE FROM formulas WHERE code=:c", {"c": ct_code})
                         write_audit(conn, "FORMULA_DELETE", ct_code)
                         st.success("Đã xóa."); st.rerun()
-
 
 def page_kho(conn, user):
     st.markdown("### 🏬 Kho")
