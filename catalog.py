@@ -1,13 +1,11 @@
-# catalog.py — Module 2: Cửa hàng, Người dùng, Danh mục & Sản phẩm & Công thức
-import json
-import pandas as pd
+# catalog.py — Module 2: Cửa hàng, Người dùng, Danh mục / Sản phẩm / Công thức
 import streamlit as st
 from core import fetch_df, run_sql, write_audit, sha256, has_perm
 
 # =============== CỬA HÀNG ===============
 def page_stores(conn, user):
     st.header("🏬 Cửa hàng (CRUD)")
-    if not has_perm(user, "STORE_EDIT") and user.get("role") != "SuperAdmin":
+    if not has_perm(user, "STORE_EDIT"):
         st.warning("Bạn không có quyền.")
         return
 
@@ -57,7 +55,7 @@ _PERM_CHOICES = [
 
 def page_users(conn, user):
     st.header("👥 Người dùng (CRUD & phân quyền)")
-    if not has_perm(user, "USER_EDIT") and user.get("role") != "SuperAdmin":
+    if not has_perm(user, "USER_EDIT"):
         st.warning("Bạn không có quyền.")
         return
 
@@ -76,7 +74,7 @@ def page_users(conn, user):
         with col2:
             role = st.selectbox("Vai trò", ["User","Manager","SuperAdmin"], index=0)
             store = st.selectbox("Cửa hàng mặc định", store_opts,
-                                 index=max(0, store_opts.index(user.get("store",""))) if user.get("store") in store_opts else 0)
+                                 index=(store_opts.index(user.get("store","")) if user.get("store") in store_opts else 0))
         with col3:
             pw = st.text_input("Mật khẩu (đặt mới / đặt lại)", type="password")
             perms = st.multiselect("Quyền chi tiết", _PERM_CHOICES, default=[])
@@ -122,7 +120,7 @@ def page_catalog(conn, user):
 
     # --- Danh mục SP ---
     with tabs[0]:
-        if not has_perm(user, "CAT_EDIT") and user.get("role") != "SuperAdmin":
+        if not has_perm(user, "CAT_EDIT"):
             st.warning("Bạn không có quyền.")
         else:
             df = fetch_df(conn, "SELECT code,name FROM categories ORDER BY code")
@@ -149,7 +147,7 @@ def page_catalog(conn, user):
 
     # --- Sản phẩm ---
     with tabs[1]:
-        if not has_perm(user, "PROD_EDIT") and user.get("role") != "SuperAdmin":
+        if not has_perm(user, "PROD_EDIT"):
             st.warning("Bạn không có quyền.")
         else:
             df = fetch_df(conn, "SELECT code,name,cat_code,uom,cups_per_kg,price_ref FROM products ORDER BY name")
@@ -164,7 +162,7 @@ def page_catalog(conn, user):
                     cat = st.selectbox("Nhóm", ["TRAI_CAY","COT","MUT","PHU_GIA","TP_KHAC"])
                     uom = st.text_input("ĐVT", value="kg")
                 with c3:
-                    cups = st.number_input("Cốc/kg TP", value=0.0, step=0.1, min_value=0.0)
+                    cups = st.number_input("Cốc/kg TP (đối với CỐT)", value=0.0, step=0.1, min_value=0.0)
                     pref = st.number_input("Giá tham chiếu", value=0.0, step=1000.0, min_value=0.0)
                 ok = st.form_submit_button("Lưu", type="primary")
             if ok:
@@ -185,12 +183,16 @@ def page_catalog(conn, user):
 
     # --- Công thức ---
     with tabs[2]:
-        if not has_perm(user, "CT_EDIT") and user.get("role") != "SuperAdmin":
+        if not has_perm(user, "CT_EDIT"):
             st.warning("Bạn không có quyền.")
             return
 
-        st.info("CỐT 1 bước (có hệ số thu hồi); MỨT không có hệ số; MỨT có 2 nguồn: TRÁI_CÂY hoặc CỐT.\n"
-                "Mỗi công thức gồm **nhiều NVL chính** và **nhiều phụ gia**. Định lượng theo *kg / 1kg thành phẩm*.")
+        st.info(
+            "• **CỐT**: 1 bước, **có** hệ số thu hồi, `cups_per_kg` = **cốc/kg TP**.\n"
+            "• **MỨT**: **KHÔNG** có hệ số thu hồi (ẩn), `cups_per_kg` = **g/cốc**.\n"
+            "• NVL chính tùy nguồn: **CỐT → Trái cây**; **MỨT → Trái cây** hoặc **Cốt**.\n"
+            "• Phụ gia từ nhóm **PHU_GIA**. Định lượng đều theo **kg / 1kg thành phẩm**."
+        )
 
         # Header list
         df_hdr = fetch_df(conn, """
@@ -208,8 +210,14 @@ def page_catalog(conn, user):
                     name = st.text_input("Tên CT")
                     typ  = st.selectbox("Loại", ["COT","MUT"])
                 with colB:
-                    cups = st.number_input("Cốc/kg TP", value=0.0, step=0.1, min_value=0.0)
-                    recovery = st.number_input("Hệ số thu hồi (CỐT)", value=1.0, step=0.01, min_value=0.01, disabled=(typ!="COT"))
+                    if typ=="COT":
+                        cups_label = "Cốc/kg TP (CỐT)"
+                        cups = st.number_input(cups_label, value=0.0, step=0.1, min_value=0.0)
+                        recovery = st.number_input("Hệ số thu hồi (CỐT)", value=1.0, step=0.01, min_value=0.01)
+                    else:
+                        cups_label = "g/cốc (MỨT)"
+                        cups = st.number_input(cups_label, value=0.0, step=1.0, min_value=0.0)
+                        recovery = 1.0  # ẩn/khóa
 
                 # Sản phẩm đầu ra theo loại
                 out_cat = "COT" if typ=="COT" else "MUT"
@@ -219,9 +227,11 @@ def page_catalog(conn, user):
                 output_pcode = "" if out_pick=="—" else out_pick.split(" — ",1)[0]
 
                 # Nguồn NVL chính
-                src_kind = "TRAI_CAY" if typ=="COT" else st.radio("Nguồn NVL cho MỨT", ["TRAI_CAY","COT"], horizontal=True)
-                src_cat  = src_kind
-                df_src = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": src_cat})
+                if typ=="COT":
+                    src_kind = "TRAI_CAY"
+                else:
+                    src_kind = st.radio("Nguồn NVL (MỨT)", ["TRAI_CAY","COT"], horizontal=True, index=0)
+                df_src = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": src_kind})
                 picked_raw = st.multiselect("Chọn NVL chính",
                                             [f"{r['code']} — {r['name']}" for _, r in df_src.iterrows()],
                                             key="raw_multi_add")
@@ -255,8 +265,7 @@ def page_catalog(conn, user):
                                 output_uom=EXCLUDED.output_uom,recovery=EXCLUDED.recovery,
                                 cups_per_kg=EXCLUDED.cups_per_kg,note=EXCLUDED.note
                         """, {"c":code,"n":name,"t":typ,"o":output_pcode,
-                              "r": (float(recovery) if typ=="COT" else 1.0),
-                              "k": float(cups),"x": note})
+                              "r": float(recovery), "k": float(cups), "x": note})
                         run_sql(conn, "DELETE FROM formula_inputs WHERE formula_code=:c", {"c":code})
                         for k,v in raw_inputs.items():
                             run_sql(conn, """
@@ -287,20 +296,26 @@ def page_catalog(conn, user):
                         name = st.text_input("Tên CT", value=hdr["name"] or "")
                         typ  = st.selectbox("Loại", ["COT","MUT"], index=(0 if hdr["type"]=="COT" else 1))
                     with colB:
-                        cups = st.number_input("Cốc/kg TP", value=float(hdr.get("cups_per_kg") or 0.0), step=0.1, min_value=0.0)
-                        rec  = st.number_input("Hệ số thu hồi (CỐT)", value=float(hdr.get("recovery") or 1.0),
-                                               step=0.01, min_value=0.01, disabled=(typ!="COT"))
+                        if typ=="COT":
+                            cups_label = "Cốc/kg TP (CỐT)"
+                            cups = st.number_input(cups_label, value=float(hdr.get("cups_per_kg") or 0.0), step=0.1, min_value=0.0)
+                            recovery = st.number_input("Hệ số thu hồi (CỐT)", value=float(hdr.get("recovery") or 1.0),
+                                                       step=0.01, min_value=0.01)
+                        else:
+                            cups_label = "g/cốc (MỨT)"
+                            cups = st.number_input(cups_label, value=float(hdr.get("cups_per_kg") or 0.0), step=1.0, min_value=0.0)
+                            recovery = 1.0  # ẩn
 
                     # Đầu ra
                     out_cat = "COT" if typ=="COT" else "MUT"
                     df_out = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": out_cat})
                     cur_out = hdr["output_pcode"]
                     options = ([f"{cur_out} — (hiện tại)"] +
-                               [f"{r['code']} — {r['name']}" for _,r in df_out.iterrows() if r["code"]!=cur_out])
-                    out_pick = st.selectbox("SP đầu ra", options, index=0)
+                               [f"{r['code']} — {r['name']}" for _,r in df_out.iterrows() if r["code"]!=cur_out]) or ["—"]
+                    out_pick = st.selectbox("Sản phẩm đầu ra", options, index=0)
                     output_pcode = cur_out if " (hiện tại)" in out_pick else out_pick.split(" — ",1)[0]
 
-                    # Nguồn NVL (mứt)
+                    # Nguồn NVL chính (MỨT)
                     if typ=="MUT":
                         src_kind = "TRAI_CAY"
                         if (hdr.get("note") or "").startswith("SRC="):
@@ -315,10 +330,9 @@ def page_catalog(conn, user):
                     raw_old = {r["pcode"]: float(r["qty_per_kg"]) for _,r in det.iterrows() if r["kind"] in ["TRAI_CAY","COT"]}
                     add_old = {r["pcode"]: float(r["qty_per_kg"]) for _,r in det.iterrows() if r["kind"]=="PHU_GIA"}
 
-                    # NVL
-                    st.markdown("#### Nguyên liệu chính")
-                    src_cat = "TRAI_CAY" if (typ=="COT" or src_kind=="TRAI_CAY") else "COT"
-                    df_src = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name", {"c": src_cat})
+                    # NVL chính
+                    df_src = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code=:c ORDER BY name",
+                                      {"c": ("TRAI_CAY" if (typ=="COT" or src_kind=="TRAI_CAY") else "COT")})
                     choices_raw = [f"{r['code']} — {r['name']}" for _,r in df_src.iterrows()]
                     defaults_raw = [f"{c} — ..." for c in raw_old.keys() if c in [r["code"] for _,r in df_src.iterrows()]]
                     picked_raw = st.multiselect("Chọn NVL chính", choices_raw, default=defaults_raw, key="src_multi_edit")
@@ -331,7 +345,6 @@ def page_catalog(conn, user):
                         if q0>0: raw_inputs[c0] = q0
 
                     # Phụ gia
-                    st.markdown("#### Phụ gia")
                     df_add = fetch_df(conn, "SELECT code,name FROM products WHERE cat_code='PHU_GIA' ORDER BY name")
                     choices_add = [f"{r['code']} — {r['name']}" for _,r in df_add.iterrows()]
                     defaults_add = [f"{c} — ..." for c in add_old.keys()]
@@ -347,22 +360,21 @@ def page_catalog(conn, user):
                     colX, colY = st.columns(2)
                     with colX:
                         if st.form_submit_button("💾 Cập nhật", type="primary"):
-                            note = "" if typ=="COT" else f"SRC={ 'TRAI_CAY' if src_kind=='TRAI_CAY' else 'COT'}"
+                            note = "" if typ=="COT" else f"SRC={'TRAI_CAY' if src_kind=='TRAI_CAY' else 'COT'}"
                             run_sql(conn, """
                                 UPDATE formulas
                                 SET name=:n, type=:t, output_pcode=:o, output_uom='kg',
                                     recovery=:r, cups_per_kg=:k, note=:x
                                 WHERE code=:c
                             """, {"n": name.strip(), "t": typ, "o": output_pcode,
-                                  "r": (float(rec) if typ=="COT" else 1.0),
-                                  "k": float(cups), "x": note, "c": ct_code})
+                                  "r": float(recovery), "k": float(cups), "x": note, "c": ct_code})
                             run_sql(conn, "DELETE FROM formula_inputs WHERE formula_code=:c", {"c": ct_code})
                             for k,v in raw_inputs.items():
                                 run_sql(conn, """
                                     INSERT INTO formula_inputs(formula_code,pcode,qty_per_kg,kind)
                                     VALUES (:f,:p,:q,:k)
                                 """, {"f": ct_code, "p": k, "q": float(v),
-                                      "k": ("TRAI_CAY" if src_cat=="TRAI_CAY" else "COT")})
+                                      "k": ("TRAI_CAY" if (typ=="COT" or src_kind=="TRAI_CAY") else "COT")})
                             for k,v in add_inputs.items():
                                 run_sql(conn, """
                                     INSERT INTO formula_inputs(formula_code,pcode,qty_per_kg,kind)
@@ -372,7 +384,7 @@ def page_catalog(conn, user):
                             st.success("Đã cập nhật."); st.rerun()
                     with colY:
                         if st.form_submit_button("🗑️ Xóa công thức"):
-                            run_sql(conn, "DELETE FROM formulas WHERE code=:c", {"c": ct_code})
                             run_sql(conn, "DELETE FROM formula_inputs WHERE formula_code=:c", {"c": ct_code})
+                            run_sql(conn, "DELETE FROM formulas WHERE code=:c", {"c": ct_code})
                             write_audit(conn, "FORMULA_DELETE", ct_code)
                             st.success("Đã xóa."); st.rerun()
