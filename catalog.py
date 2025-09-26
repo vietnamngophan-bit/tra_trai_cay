@@ -210,7 +210,7 @@ def page_catalog(conn, user):
             typ = st.selectbox("Loại", ["COT","MUT"], key="ct_type_add")
             if "last_ct_type_add" not in st.session_state or st.session_state["last_ct_type_add"] != typ:
                 st.session_state["last_ct_type_add"] = typ
-                st.experimental_rerun()
+                st.rerun()
 
             with st.form("fm_ct_add", clear_on_submit=True):
                 colA, colB = st.columns(2)
@@ -306,7 +306,7 @@ def page_catalog(conn, user):
                 typ = st.selectbox("Loại", ["COT","MUT"], index=(0 if default_type=="COT" else 1), key="ct_type_edit")
                 if "last_ct_type_edit" not in st.session_state or st.session_state["last_ct_type_edit"] != typ:
                     st.session_state["last_ct_type_edit"] = typ
-                    st.experimental_rerun()
+                    st.rerun()
 
                 with st.form("fm_ct_edit", clear_on_submit=True):
                     colA, colB = st.columns(2)
