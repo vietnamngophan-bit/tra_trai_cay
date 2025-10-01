@@ -6,8 +6,6 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection
 
-st.set_page_config(page_title="Quản Trị Trà Trái Cây", page_icon="🍵", layout="wide")
-
 # ---------- Kết nối Postgres ----------
 _ENGINE = None
 def _normalize(url: str) -> str:
