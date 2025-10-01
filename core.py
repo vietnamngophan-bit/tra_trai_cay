@@ -1,13 +1,15 @@
-# core.py
-import re, hashlib
+import os, re, hashlib
 from datetime import datetime
 import pandas as pd
+import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection
 
 # ---------- Kết nối Postgres ----------
 _ENGINE = None
+
 def _normalize(url: str) -> str:
+    """Chuẩn hoá URL Postgres để SQLAlchemy kết nối an toàn"""
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg2://", 1)
     elif url.startswith("postgresql://") and "+psycopg2" not in url:
@@ -17,16 +19,19 @@ def _normalize(url: str) -> str:
     return url
 
 def get_conn() -> Connection:
+    """Trả về connection Postgres"""
     global _ENGINE
     url = os.getenv("DATABASE_URL", "").strip()
     if not url:
-        st.error("Thiếu biến môi trường DATABASE_URL"); st.stop()
+        st.error("❌ Thiếu biến môi trường DATABASE_URL (Postgres)")
+        st.stop()
     if _ENGINE is None:
         _ENGINE = create_engine(_normalize(url), pool_pre_ping=True, future=True)
     return _ENGINE.connect()
 
 # ---------- SQL helpers ----------
 def _qmark_to_named(sql: str, params):
+    """Chuyển ? thành :p1, :p2 cho SQLAlchemy"""
     if not isinstance(params, (list, tuple)): return sql, params
     i = 1
     def repl(_):
@@ -47,7 +52,8 @@ def fetch_df(conn: Connection, sql: str, params=None) -> pd.DataFrame:
     return pd.read_sql_query(text(sql), conn, params=params or {})
 
 # ---------- Auth & Audit ----------
-def sha256(s: str) -> str: return hashlib.sha256(s.encode("utf-8")).hexdigest()
+def sha256(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def write_audit(conn: Connection, action: str, detail: str = ""):
     try:
@@ -111,15 +117,18 @@ def store_selector(conn: Connection, user: dict):
     st.sidebar.caption("Kết nối: Postgres (Supabase)")
     df = fetch_df(conn, "SELECT code,name FROM stores ORDER BY name")
     labels = ["— Tất cả —"] + [f"{r['code']} — {r['name']}" for _, r in df.iterrows()]
-    pick = st.sidebar.selectbox("Cửa hàng", labels, index=(labels.index(f"{user.get('store','')} — {df[df['code']==user.get('store','')]['name'].iloc[0]}") if user.get('store') and not df.empty and user['store'] in df['code'].values else 0))
+    default_idx = 0
+    if user.get("store") and not df.empty and user["store"] in df["code"].values:
+        store_name = df[df["code"] == user["store"]]["name"].iloc[0]
+        default_idx = labels.index(f"{user['store']} — {store_name}")
+    pick = st.sidebar.selectbox("Cửa hàng", labels, index=default_idx)
     if pick != "— Tất cả —":
         st.session_state["store"] = pick.split(" — ",1)[0]
     elif "store" in st.session_state:
         del st.session_state["store"]
 
-# ---------- Router duy nhất (chỉ hiện module đã có) ----------
+# ---------- Router ----------
 def router(conn: Connection, user: dict):
-    # (label, handler_name)
     candidates = [
         ("Danh mục",   "page_catalog"),
         ("Sản xuất",   "page_production"),
@@ -135,10 +144,8 @@ def router(conn: Connection, user: dict):
     labels = [lbl for lbl, _ in visible]
     choice = st.sidebar.radio("", labels, index=0, label_visibility="collapsed")
 
-    # gọi hàm nếu đã import từ module khác
     for lbl, fn in visible:
         if lbl == choice:
-            # ưu tiên hàm đã import vào global qua from <module> import page_xxx
             if fn in globals() and callable(globals()[fn]):
                 globals()[fn](conn, user)
             else:
